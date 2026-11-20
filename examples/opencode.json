@@ -1,0 +1,17 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "servers": {
+      "toolnet-devtools": {
+        "type": "local",
+        "command": ["node", "/absolute/path/to/toolnet-devtools-mcp/src/index.mjs"],
+        "environment": {
+          "CDP_ENDPOINT": "http://127.0.0.1:9222",
+          "DEVTOOLS_PERMISSION": "interactive",
+          "DEVTOOLS_AUTO_LAUNCH": "1",
+          "DEVTOOLS_HEADLESS": "1"
+        }
+      }
+    }
+  }
+}

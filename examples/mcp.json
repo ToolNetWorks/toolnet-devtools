@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "toolnet-devtools": {
+      "command": "node",
+      "args": ["/absolute/path/to/toolnet-devtools-mcp/src/index.mjs"],
+      "env": {
+        "CDP_ENDPOINT": "http://127.0.0.1:9222",
+        "DEVTOOLS_PERMISSION": "interactive",
+        "DEVTOOLS_AUTO_LAUNCH": "1",
+        "DEVTOOLS_HEADLESS": "1"
+      }
+    }
+  }
+}

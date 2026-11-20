@@ -1,0 +1,16 @@
+{
+  "name": "toolnet-devtools-mcp",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Dependency-free universal Chrome DevTools MCP server for AI agents",
+  "type": "module",
+  "bin": { "toolnet-devtools": "./src/index.mjs" },
+  "scripts": {
+    "start": "node src/index.mjs",
+    "test": "node --test test/core.test.mjs test/features.test.mjs",
+    "test:integration": "DEVTOOLS_PERMISSION=full-debug DEVTOOLS_ALLOW_SENSITIVE=1 node --test test/integration.test.mjs",
+    "test:all": "npm test && npm run test:integration"
+  },
+  "engines": { "node": ">=22" },
+  "license": "MIT"
+}
