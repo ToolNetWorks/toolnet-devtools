@@ -2,7 +2,7 @@
 
 A dependency-free **universal Chrome DevTools MCP server** for AI coding agents. It drives any `http://` or `https://` site through the **Chrome DevTools Protocol (CDP)** and exposes Console, Network, WebSocket, DOM/CSS, Debugger, Performance, Storage and export workflows as MCP tools.
 
-No Playwright, Puppeteer, Selenium, browser download, database or `npm install` is required. Only Node.js and a locally installed Chrome/Chromium are needed.
+No Playwright, Puppeteer, Selenium, browser download, or database is required. Run it directly with Node.js, or install from npm. A locally installed Chrome/Chromium is needed for browser automation.
 
 ## Highlights
 
@@ -14,6 +14,8 @@ No Playwright, Puppeteer, Selenium, browser download, database or `npm install` 
 - **No manual tab setup** - create, select, close, reload, navigate back/forward, click, type, press keys and scroll through tools.
 - **Safe defaults** - three permission tiers, loopback-only CDP endpoints, secret redaction and bounded buffers.
 - **Durable artifacts** - JSON, HAR 1.2, error report, trace and `.cpuprofile` exports inside a confined export directory.
+- **Reverse engineering & deep analysis** - API pattern/JSON-shape reports, GraphQL endpoint discovery + introspection, source-map metadata fetch, and Burp Repeater-lite request replay (authorized targets only).
+- **Security & LLM probes** - passive credential-exposure/auth-gate/attack-surface scanning and garak-style Opposite Day/BOM/AntiGPT/reversed-string jailbreak probing for authorized chat UIs.
 - **57 MCP tools** including `devtools_f12_check`, emulation/network control, interception/mock, accessibility/PDF/snapshot, storage-state, download/upload, drag/drop, locator-based input actions, reverse-engineering, LLM chat probing, security probing, GraphQL/source-map/request-replay deep analysis, JSON-RPC stdio transport, works with Codex CLI, OpenCode and other MCP clients.
 
 ## Requirements
@@ -22,20 +24,52 @@ No Playwright, Puppeteer, Selenium, browser download, database or `npm install` 
 - Chrome or Chromium installed locally for auto-launch. An already-running Chrome with CDP enabled is also supported.
 - An MCP-capable agent/client.
 
-There is nothing to install in this repository.
+**Option A — run from source (zero install):**
+
+```sh
+git clone https://github.com/ToolNetWorks/toolnet-devtools.git
+cd toolnet-devtools
+node src/index.mjs
+```
+
+**Option B — install from npm:**
+
+```sh
+npm install -g toolnet-devtools-mcp
+toolnet-devtools
+# or without global install:
+npx -y toolnet-devtools-mcp
+```
 
 ## Quick start
 
 ### 1. Point your MCP client at the server
 
-Generic MCP configuration (replace the absolute path):
+**From npm (recommended):**
+
+```json
+{
+  "mcpServers": {
+    "toolnet-devtools": {
+      "command": "npx",
+      "args": ["-y", "toolnet-devtools-mcp"],
+      "env": {
+        "CDP_ENDPOINT": "http://127.0.0.1:9222",
+        "DEVTOOLS_PERMISSION": "interactive"
+      }
+    }
+  }
+}
+```
+
+**From source:**
 
 ```json
 {
   "mcpServers": {
     "toolnet-devtools": {
       "command": "node",
-      "args": ["/absolute/path/to/toolnet-devtools-mcp/src/index.mjs"],
+      "args": ["/absolute/path/to/toolnet-devtools/src/index.mjs"],
       "env": {
         "CDP_ENDPOINT": "http://127.0.0.1:9222",
         "DEVTOOLS_PERMISSION": "interactive"
@@ -361,13 +395,15 @@ npm run test:integration
 npm run test:all
 ```
 
+CI runs on GitHub Actions (`.github/workflows/ci.yml`) on push/PR to `main`: installs Chrome, runs unit tests and real-Chromium integration tests. A separate `publish.yml` publishes to npm with OIDC provenance when the package version is not already on npm.
+
 ### Verified results
 
 This version was exercised against **real Chromium, Chrome/157.0.8103.38 on Linux x86_64**:
 
-- **Unit tests:** 14 passed, 0 failed.
-- **Integration tests:** 16 passed, 0 failed (13 end-to-end subtests, a read-only permission test and an auto-launch test).
-- Cumulative coverage included initial-request capture, console errors/exceptions, API bodies, redirects, WebSocket frames, DOM/CSS, click/type/scroll/screenshot, debugger breakpoints and paused-frame evaluation, dialogs, performance metrics, tracing, CPU profiles, cookies/storage redaction, capture windows, HAR/JSON/report/trace/profile exports, history navigation, multi-tab buffer isolation, multiple public domains, and automatic headless launch/cleanup.
+- **Unit tests:** 38 passed, 0 failed.
+- **Integration tests:** 28 passed, 0 failed (including auto-launch and read-only/interactive permission flows).
+- Coverage includes: first-byte F12 capture, console/errors/exceptions, API bodies, redirects, WebSocket frames, DOM/CSS, click/type/scroll/screenshot, debugger breakpoints and paused-frame evaluation, dialogs, performance metrics, tracing, CPU profiles, cookies/storage redaction, capture windows, HAR/JSON/report/trace/profile exports, history navigation, multi-tab isolation, public domains, auto headless launch/cleanup, **GraphQL discovery/introspection, source-map fetch, request replay, security findings, reverse-engineering reports, and LLM probe susceptibility**.
 
 To run the same suite, start Chrome on `127.0.0.1:9222` (or let the auto-launch test start a browser on `9333`) and run `npm run test:all`.
 
@@ -375,8 +411,9 @@ To run the same suite, start Chrome on `127.0.0.1:9222` (or let the auto-launch 
 
 This server grants browser control to the connected agent. Use a dedicated Chrome profile and test accounts.
 
-- Keep CDP on loopback; never expose port 9222 to a network.
-- Use `read-only` for production log inspection and `interactive` for controlled reproduction.
-- Leave `DEVTOOLS_ALLOW_SENSITIVE` unset unless raw cookies/tokens are genuinely required.
-- Treat downloaded exports as sensitive; they may contain URLs, headers or page data.
-- Destructive CDP browser commands (browser close/crash, target close, storage clearing) are blocked through `devtools_cdp`. Dedicated storage clear operations require `confirm=true`.
+- **VPS / remote host**: bind CDP to loopback only (`127.0.0.1`); **never expose port 9222 to the Internet**. Do not use `CDP_ALLOW_REMOTE=1` on public hosts.
+- **Isolated profile**: run Chrome with a dedicated `--user-data-dir`/`DEVTOOLS_PROFILE_DIR`. Do not attach to or auto-launch against a profile containing sensitive logged-in sessions (email, banking, cloud admin, etc.).
+- **Permission tiers**: use `read-only` for inspection; `interactive` for controlled reproduction (allows click/type/side-effectful JS/navigation); `full-debug` only when you need debugger/raw CDP/sensitive exports.
+- **Sensitive data**: leave `DEVTOOLS_ALLOW_SENSITIVE` unset unless raw cookies/tokens are genuinely required. Treat exports as sensitive.
+- **Authorized testing only**: `devtools_reverse_engineer`, `devtools_security_probe`, `devtools_graphql` introspection, `devtools_sourcemap`, `devtools_replay`, and `devtools_llm_probe` are intended for targets you own or are explicitly authorized to test. Do not use them for unauthorized access, credential stealing, paywall bypass, or intrusion.
+- **CDP safeguards**: destructive browser commands (browser close/crash, target close, storage clearing) are blocked through `devtools_cdp`. Dedicated storage clear operations require `confirm=true`.
