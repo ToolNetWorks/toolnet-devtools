@@ -1,51 +1,60 @@
-# ToolNet DevTools MCP v0.4.0
+# ToolNet DevTools MCP
 
-A dependency-free **universal Chrome DevTools MCP server** for AI coding agents. It drives any `http://` or `https://` site through the **Chrome DevTools Protocol (CDP)** and exposes Console, Network, WebSocket, DOM/CSS, Debugger, Performance, Storage and export workflows as MCP tools.
+[![npm](https://img.shields.io/npm/v/toolnet-devtools-mcp)](https://www.npmjs.com/package/toolnet-devtools-mcp)
+[![CI](https://github.com/ToolNetWorks/toolnet-devtools/actions/workflows/ci.yml/badge.svg)](https://github.com/ToolNetWorks/toolnet-devtools/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Node.js](https://img.shields.io/badge/node-%3E%3D22-brightgreen)](package.json)
 
-No Playwright, Puppeteer, Selenium, browser download, or database is required. Run it directly with Node.js, or install from npm. A locally installed Chrome/Chromium is needed for browser automation.
+A dependency-free **Chrome DevTools Protocol (CDP) MCP server** for AI coding agents. It gives agents full, automatic browser control over any `http://` or `https://` site — Console, Network, DOM, Debugger, Performance, Storage, and export — without Playwright, Puppeteer, or Selenium.
 
-## Highlights
+> **v0.4.0** · 57 MCP tools · Node.js ≥ 22 · Zero runtime dependencies
 
-- **Universal navigation** - open any HTTP/HTTPS URL, not a fixed list of sites.
-- **Automatic browser management** - connects to an existing CDP endpoint or launches an isolated headless Chromium when none is available.
-- **First-byte capture** - `devtools_open_url` creates a blank tab, attaches CDP and enables Network/Runtime/Log/Page *before* navigating, so the initial document and API calls are recorded.
-- **Real DevTools domains** - console errors and stack traces, request/response bodies, redirects, timing, WebSocket frames, DOM/CSS, breakpoints, paused call frames, performance metrics, tracing, CPU profiles, cookies and web storage.
-- **One-call F12 check** - `devtools_f12_check` runs the full automatic workflow and returns console errors, failed/slow requests, WebSocket activity, page state and performance metrics.
-- **No manual tab setup** - create, select, close, reload, navigate back/forward, click, type, press keys and scroll through tools.
-- **Safe defaults** - three permission tiers, loopback-only CDP endpoints, secret redaction and bounded buffers.
-- **Durable artifacts** - JSON, HAR 1.2, error report, trace and `.cpuprofile` exports inside a confined export directory.
-- **Reverse engineering & deep analysis** - API pattern/JSON-shape reports, GraphQL endpoint discovery + introspection, source-map metadata fetch, and Burp Repeater-lite request replay (authorized targets only).
-- **Security & LLM probes** - passive credential-exposure/auth-gate/attack-surface scanning and garak-style Opposite Day/BOM/AntiGPT/reversed-string jailbreak probing for authorized chat UIs.
-- **57 MCP tools** including `devtools_f12_check`, emulation/network control, interception/mock, accessibility/PDF/snapshot, storage-state, download/upload, drag/drop, locator-based input actions, reverse-engineering, LLM chat probing, security probing, GraphQL/source-map/request-replay deep analysis, JSON-RPC stdio transport, works with Codex CLI, OpenCode and other MCP clients.
+## Why ToolNet DevTools
 
-## Requirements
+| Capability | What it means |
+|---|---|
+| **One-call F12 capture** | `devtools_f12_check` creates a blank tab, attaches CDP, enables Network/Runtime/Page/Log *before* navigation, loads the URL, and returns console errors, failed/slow requests, WebSocket activity, and capture proof. No manual reload. |
+| **Automatic browser lifecycle** | Connects to an existing CDP endpoint or auto-launches an isolated headless Chromium; reuses sessions; shuts down only browsers it launched. |
+| **Full DevTools domains** | Console/stack traces, request/response bodies, redirects, timing, WebSocket frames, DOM/CSS, breakpoints, paused-frame eval, metrics, tracing, CPU profiles, cookies/storage. |
+| **Real interaction** | Click, type, press keys, scroll, hover, drag, select, upload, download, dialog handling — with selector/xpath/text/role/testId locators. |
+| **Reverse engineering & deep analysis** | API pattern/JSON-shape reports, GraphQL discovery + introspection, source-map metadata, Burp Repeater-lite request replay (authorized targets only). |
+| **Security & LLM probes** | Passive credential-exposure/auth-gate/attack-surface scans; garak-style Opposite Day/BOM/AntiGPT/reversed-string jailbreak probing for authorized chat UIs. |
+| **Safe by default** | Three permission tiers, loopback-only CDP, secret redaction, bounded buffers, confined export directory, sensitive-data gate. |
 
-- Node.js **22 or newer** (uses the built-in global `WebSocket` and `fetch`).
-- Chrome or Chromium installed locally for auto-launch. An already-running Chrome with CDP enabled is also supported.
-- An MCP-capable agent/client.
+## Installation
 
-**Option A — run from source (zero install):**
+### Requirements
 
-```sh
+- **Node.js 22+** (uses built-in global `WebSocket` and `fetch`)
+- **Chrome or Chromium** installed locally (for auto-launch), or an existing Chrome with CDP enabled
+- An **MCP-capable client** (OpenCode, Codex CLI, Claude Desktop, etc.)
+
+### Option A — npm (recommended)
+
+```bash
+npm install -g toolnet-devtools-mcp
+toolnet-devtools
+```
+
+Or run without installing globally:
+
+```bash
+npx -y toolnet-devtools-mcp
+```
+
+### Option B — from source
+
+```bash
 git clone https://github.com/ToolNetWorks/toolnet-devtools.git
 cd toolnet-devtools
 node src/index.mjs
 ```
 
-**Option B — install from npm:**
+## Quick Start
 
-```sh
-npm install -g toolnet-devtools-mcp
-toolnet-devtools
-# or without global install:
-npx -y toolnet-devtools-mcp
-```
+### 1. Configure your MCP client
 
-## Quick start
-
-### 1. Point your MCP client at the server
-
-**From npm (recommended):**
+**npm / npx (recommended):**
 
 ```json
 {
@@ -79,31 +88,17 @@ npx -y toolnet-devtools-mcp
 }
 ```
 
-Ready-to-copy examples:
+Ready-to-copy configs: [`examples/mcp.json`](examples/mcp.json) · [`examples/opencode.json`](examples/opencode.json) · [`examples/codex.config.toml`](examples/codex.config.toml)
 
-- [`examples/mcp.json`](examples/mcp.json) - generic MCP clients
-- [`examples/opencode.json`](examples/opencode.json) - OpenCode V2 (`mcp.servers`)
-- [`examples/codex.config.toml`](examples/codex.config.toml) - Codex CLI (`~/.codex/config.toml` or `.codex/config.toml`)
+### 2. Run a one-call F12 check
 
-### 2. Ask the agent to open a URL
+Ask your agent:
 
 ```text
 Use devtools_f12_check on https://example.com.
 ```
 
-You do not need to open Chrome, create a tab, navigate or reload. A single call to `devtools_f12_check`, `devtools_navigate_and_capture`, or `devtools_open_url` will:
-
-1. Check `CDP_ENDPOINT` for a reachable browser, or auto-launch an isolated headless Chrome if needed.
-2. Create a blank tab when required.
-3. Attach CDP and enable Network/Runtime/Page/Log **before** any navigation.
-4. Navigate to the requested URL, wait for load, and optionally wait for a continuous network-quiet window so delayed XHR/fetch calls are captured.
-5. Return captured requests/console state, diagnostics, and proof that Network was enabled before navigation.
-
-The MCP server itself is a stdio process, not an interactive CLI:
-
-```sh
-node src/index.mjs
-```
+The server automatically: checks/launches Chrome → creates a blank tab → attaches CDP → enables Network/Runtime/Page/Log **before navigation** → navigates → waits for load + network-quiet → returns capture proof, console errors, failed/slow requests, WebSocket activity, and performance metrics. No manual browser setup required.
 
 ## Browser lifecycle and auto-launch
 
