@@ -19,4 +19,12 @@ jobs:
           node-version: '24.x'
           registry-url: 'https://registry.npmjs.org'
       - run: npm install --ignore-scripts
-      - run: npm publish --provenance --access public
+      - name: Publish if version not on npm
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          NAME=$(node -p "require('./package.json').name")
+          if npm view "${NAME}@${VERSION}" version >/dev/null 2>&1; then
+            echo "Skipping publish: ${NAME}@${VERSION} already exists on npm"
+            exit 0
+          fi
+          npm publish --provenance --access public
