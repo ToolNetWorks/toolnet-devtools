@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Chrome
+        uses: browser-actions/setup-chrome@v2
+        with:
+          chrome-version: stable
+
+      - name: Show versions
+        run: |
+          node --version
+          npm --version
+          google-chrome --version || chromium --version || true
+
+      - name: Start Chrome with CDP
+        run: |
+          CHROME_BIN="$(command -v google-chrome || command -v google-chrome-stable || command -v chromium-browser || command -v chromium)"
+          echo "Using Chrome: $CHROME_BIN"
+          "$CHROME_BIN" \
+            --headless=new \
+            --no-sandbox \
+            --disable-dev-shm-usage \
+            --remote-debugging-address=127.0.0.1 \
+            --remote-debugging-port=9222 \
+            --user-data-dir=/tmp/toolnet-devtools-chrome \
+            about:blank > /tmp/chrome.log 2>&1 &
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:9222/json/version >/tmp/chrome-version.json; then
+              echo "Chrome CDP ready"
+              cat /tmp/chrome-version.json
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Chrome failed to start"
+          tail -n 200 /tmp/chrome.log || true
+          exit 1
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Integration tests
+        env:
+          DEVTOOLS_PERMISSION: full-debug
+          DEVTOOLS_ALLOW_SENSITIVE: "1"
+        run: npm run test:integration
+
+      - name: Upload Chrome log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chrome-log
+          path: /tmp/chrome.log
+          if-no-files-found: ignore
