@@ -7,7 +7,7 @@ function protocolVersion(requested) {
   return ACCEPTED_PROTOCOLS.includes(requested) ? requested : ACCEPTED_PROTOCOLS[1];
 }
 
-export function runStdioServer({ registry, manager, version = '0.2.0', logger = console }) {
+export function runStdioServer({ registry, manager, version = '0.3.0', logger = console }) {
   const maxResponse = (() => {
     const raw = Number(process.env.DEVTOOLS_MAX_RESPONSE_CHARS);
     return Number.isInteger(raw) ? Math.max(10_000, Math.min(500_000, raw)) : 60_000;
@@ -36,10 +36,12 @@ export function runStdioServer({ registry, manager, version = '0.2.0', logger = 
         capabilities: { tools: { listChanged: false } },
         serverInfo: { name: 'toolnet-devtools-mcp', version },
         instructions: [
-          'Universal Chrome DevTools MCP for any HTTP/HTTPS site. Fully automatic CDP control: no manual tab opening, navigation or reload is required when DEVTOOLS_AUTO_LAUNCH is enabled.',
-          'For a complete F12 check from the first byte, call devtools_navigate_and_capture (or devtools_open_url). It ensures Chrome is available, creates a blank tab when needed, attaches CDP and enables Network/Runtime/Page/Log BEFORE navigation, navigates, waits and returns capture data with proof that Network was enabled before navigation.',
-          'After capture: devtools_diagnose, devtools_console, devtools_network, devtools_request, devtools_response_body and devtools_websocket for analysis; devtools_click, devtools_type, devtools_scroll, devtools_reload and devtools_select_tab for interaction and multi-tab workflows.',
-          'Export with devtools_export format=har or format=report. Default permission is interactive; debugger/tracing/raw CDP require full-debug. Sensitive cookie/token values are redacted by default and require full-debug + DEVTOOLS_ALLOW_SENSITIVE=1 + includeSensitive=true.'
+          'Universal Chrome DevTools MCP for any HTTP/HTTPS site. It fully controls Chrome through CDP; never ask the user to open a tab, navigate, reload, click, type or scroll manually.',
+          'When the user gives any URL, asks to open/inspect a site, or says "check F12"/"inspect DevTools", call devtools_f12_check or devtools_navigate_and_capture FIRST. Do not call devtools_attach first for a new URL.',
+          'devtools_f12_check runs the complete one-call workflow: ensure Chrome, create a blank tab, attach CDP, enable Network/Runtime/Page/Log BEFORE navigation, navigate, wait for load and delayed network activity, then return console errors, failed/slow requests, WebSocket activity, page state and performance metrics with proof that Network was enabled before navigation.',
+          'After capture: devtools_console, devtools_network, devtools_request, devtools_response_body and devtools_websocket for analysis; devtools_click, devtools_type, devtools_press_key, devtools_scroll, devtools_evaluate, devtools_reload, devtools_history and devtools_select_tab for follow-up interaction and multi-tab workflows.',
+          'Normal browser automation only needs the interactive permission tier; breakpoints/tracing/raw CDP require full-debug. Sensitive cookie/token values are redacted by default and require full-debug + DEVTOOLS_ALLOW_SENSITIVE=1 + includeSensitive=true.',
+          'Export with devtools_export format=har or format=report for a durable artifact.'
         ].join(' ')
       });
       return;

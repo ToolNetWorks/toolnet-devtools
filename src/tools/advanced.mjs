@@ -158,6 +158,185 @@ export function registerAdvancedTools(registry) {
   );
 
   add(
+    'devtools_intercept',
+    'Intercept and mock/block/continue network requests using Fetch domain. Rules are in-memory per session.',
+    shape({
+      tabId: tabIdSchema,
+      action: enumStr('Interception action', ['enable', 'disable', 'status', 'add_rule', 'clear_rules', 'list_rules'], { default: 'status' }),
+      patterns: { type: 'array', description: 'URL patterns for Fetch.enable, e.g. ["*"] or ["https://api.example/*"]', items: { type: 'string' } },
+      handleAuth: flag('Handle auth challenges (default false)'),
+      rule: {
+        type: 'object',
+        description: 'Rule for add_rule: {urlPattern, method, action:continue|block|mock, status, headers, body, once}',
+        additionalProperties: true
+      }
+    }),
+    'interactive',
+    async ({ tabId, action = 'status', patterns = ['*'], handleAuth = false, rule }, ctx) => {
+      const session = await ctx.session(tabId);
+      if (action === 'enable') return { sessionId: session.tab?.id, ...(await session.enableFetchInterception({ patterns, handleAuth })) };
+      if (action === 'disable') return { sessionId: session.tab?.id, ...(await session.disableFetchInterception()) };
+      if (action === 'add_rule') {
+        if (!rule || typeof rule !== 'object') throw new Error('rule object is required for add_rule');
+        const added = session.addFetchRule(rule);
+        if (!session.fetchInterception?.enabled) await session.enableFetchInterception({ patterns, handleAuth });
+        return { sessionId: session.tab?.id, added, interception: session.listFetchRules() };
+      }
+      if (action === 'clear_rules') return { sessionId: session.tab?.id, ...(session.clearFetchRules()) };
+      if (action === 'list_rules' || action === 'status') return { sessionId: session.tab?.id, ...session.listFetchRules() };
+      throw new Error('Unknown intercept action');
+    }
+  );
+
+  add(
+    'devtools_emulate',
+    'Emulate device/network/media/geolocation/timezone/locale/user-agent for the current tab. Use clear* flags or action=clear to reset.',
+    shape({
+      tabId: tabIdSchema,
+      action: enumStr('Emulation action', ['set', 'clear', 'status'], { default: 'set' }),
+      width: num('Viewport width (1-10000)', { minimum: 1, maximum: 10000 }),
+      height: num('Viewport height (1-10000)', { minimum: 1, maximum: 10000 }),
+      deviceScaleFactor: { type: 'number', description: 'Device scale factor (0.1-10)' },
+      mobile: flag('Emulate mobile device metrics'),
+      hasTouch: flag('Enable touch emulation'),
+      userAgent: str('User-Agent override', { maxLength: 2000 }),
+      acceptLanguage: str('Accept-Language override', { maxLength: 200 }),
+      platform: str('Navigator platform override', { maxLength: 200 }),
+      locale: str('Locale override, e.g. en-US'),
+      timezoneId: str('Timezone override, e.g. America/New_York'),
+      latitude: { type: 'number', description: 'Geolocation latitude' },
+      longitude: { type: 'number', description: 'Geolocation longitude' },
+      accuracy: { type: 'number', description: 'Geolocation accuracy in meters' },
+      colorScheme: enumStr('Prefers-color-scheme', ['light', 'dark', 'no-preference']),
+      reducedMotion: enumStr('Prefers-reduced-motion', ['reduce', 'no-preference']),
+      forcedColors: enumStr('Forced-colors', ['active', 'none']),
+      media: str('Emulated CSS media type, e.g. print or screen'),
+      offline: flag('Emulate offline network'),
+      latency: num('Network latency in ms (0-10000)', { minimum: 0, maximum: 10000 }),
+      downloadThroughput: { type: 'number', description: 'Download throughput bytes/sec (-1 disables)' },
+      uploadThroughput: { type: 'number', description: 'Upload throughput bytes/sec (-1 disables)' },
+      connectionType: enumStr('Connection type', ['none', 'cellular2g', 'cellular3g', 'cellular4g', 'bluetooth', 'ethernet', 'wifi', 'wimax', 'other']),
+      cacheDisabled: flag('Disable browser cache'),
+      extraHTTPHeaders: { type: 'object', description: 'Extra HTTP headers to send with every request', additionalProperties: { type: 'string' } },
+      blockedURLs: { type: 'array', description: 'URL patterns to block (Network.setBlockedURLs)', items: { type: 'string' }, maxItems: 200 },
+      clearViewport: flag('Clear viewport override'),
+      clearGeolocation: flag('Clear geolocation override')
+    }),
+    'interactive',
+    async (args, ctx) => {
+      const session = await ctx.session(args.tabId);
+      if (args.action === 'status') {
+        const info = await session.pageInfo();
+        return { sessionId: session.tab?.id, action: 'status', viewport: info.viewport, page: info };
+      }
+      if (args.action === 'clear' || args.clearViewport) await session.clearViewport();
+      if (args.action === 'clear' || args.clearGeolocation) await session.clearGeolocation();
+      if (args.action === 'clear') {
+        await session.emulateNetwork({ offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: -1, connectionType: 'none' }).catch(() => {});
+        await session.setCacheDisabled(false).catch(() => {});
+        await session.setExtraHTTPHeaders({}).catch(() => {});
+        await session.setBlockedURLs([]).catch(() => {});
+        return { sessionId: session.tab?.id, cleared: true };
+      }
+      const applied = {};
+      if (Number.isInteger(args.width) && Number.isInteger(args.height)) {
+        applied.viewport = await session.setViewport({
+          width: args.width, height: args.height,
+          deviceScaleFactor: args.deviceScaleFactor ?? 1,
+          mobile: args.mobile === true,
+          hasTouch: args.hasTouch === true
+        });
+      }
+      if (args.userAgent) applied.userAgent = await session.setUserAgent(args.userAgent, { acceptLanguage: args.acceptLanguage, platform: args.platform });
+      if (args.locale) applied.locale = await session.setLocale(args.locale);
+      if (args.timezoneId) applied.timezone = await session.setTimezone(args.timezoneId);
+      if (Number.isFinite(args.latitude) && Number.isFinite(args.longitude)) {
+        applied.geolocation = await session.setGeolocation({ latitude: args.latitude, longitude: args.longitude, accuracy: args.accuracy ?? 1 });
+      }
+      if (args.media || args.colorScheme || args.reducedMotion || args.forcedColors) {
+        applied.media = await session.emulateMedia({ media: args.media, colorScheme: args.colorScheme, reducedMotion: args.reducedMotion, forcedColors: args.forcedColors });
+      }
+      if (args.offline !== undefined || args.latency !== undefined || args.downloadThroughput !== undefined || args.uploadThroughput !== undefined || args.connectionType) {
+        applied.network = await session.emulateNetwork({
+          offline: args.offline === true,
+          latency: args.latency ?? 0,
+          downloadThroughput: args.downloadThroughput ?? -1,
+          uploadThroughput: args.uploadThroughput ?? -1,
+          connectionType: args.connectionType ?? 'none'
+        });
+      }
+      if (args.cacheDisabled !== undefined) applied.cacheDisabled = await session.setCacheDisabled(args.cacheDisabled);
+      if (args.extraHTTPHeaders) applied.extraHTTPHeaders = await session.setExtraHTTPHeaders(args.extraHTTPHeaders);
+      if (args.blockedURLs) applied.blockedURLs = await session.setBlockedURLs(args.blockedURLs);
+      return { sessionId: session.tab?.id, action: 'set', applied, page: await session.pageInfo() };
+    }
+  );
+
+  add(
+    'devtools_accessibility',
+    'Get an accessibility tree snapshot for the current page (useful for semantic element discovery).',
+    shape({
+      tabId: tabIdSchema,
+      interestingOnly: flag('Only include interesting/semantic nodes (default true)')
+    }),
+    'read-only',
+    async ({ tabId, interestingOnly = true }, ctx) => {
+      const session = await ctx.session(tabId);
+      return { sessionId: session.tab?.id, ...(await session.accessibilitySnapshot({ interestingOnly })) };
+    }
+  );
+
+  add(
+    'devtools_snapshot',
+    'Capture a fast agent-friendly snapshot: page info, accessibility summary, key interactive elements, console/network errors.',
+    shape({
+      tabId: tabIdSchema,
+      includeAccessibility: flag('Include accessibility nodes (default true)'),
+      interestingOnly: flag('Only interesting accessibility nodes (default true)'),
+      maxElements: num('Max interactive elements (1-200)', { minimum: 1, maximum: 200 })
+    }),
+    'read-only',
+    async ({ tabId, includeAccessibility = true, interestingOnly = true, maxElements = 80 }, ctx) => {
+      const session = await ctx.session(tabId);
+      const [page, ax, elements] = await Promise.all([
+        session.pageInfo(),
+        includeAccessibility ? session.accessibilitySnapshot({ interestingOnly }).catch(e => ({ error: String(e?.message ?? e) })) : Promise.resolve(null),
+        session.evaluateValue(`(() => {
+          const sel = 'a,button,input,select,textarea,[role="button"],[role="link"],[role="textbox"],[contenteditable="true"]';
+          return [...document.querySelectorAll(sel)].slice(0, ${Math.max(1, Math.min(200, maxElements))}).map((el, i) => {
+            const r = el.getBoundingClientRect();
+            const style = getComputedStyle(el);
+            const visible = r.width>0 && r.height>0 && style.visibility!=='hidden' && style.display!=='none';
+            return { i, tag: el.tagName.toLowerCase(), role: el.getAttribute('role')||undefined, name: (el.getAttribute('aria-label')||el.innerText||el.textContent||el.value||'').trim().slice(0,120), type: el.type||undefined, href: el.href||undefined, id: el.id||undefined, testId: el.getAttribute('data-testid')||el.getAttribute('data-test-id')||undefined, visible, disabled: !!el.disabled };
+          });
+        })()`).catch(e => ({ error: String(e?.message ?? e) }))
+      ]);
+      const errors = session.console.items.filter(e => e.level === 'error' || e.category === 'exception').slice(-10);
+      const failed = [...session.requests.values()].filter(r => r.failed || (r.status ?? 0) >= 400).slice(-10).map(r => ({ id: r.id, url: r.url, status: r.status, error: r.errorText }));
+      return { sessionId: session.tab?.id, page, accessibility: ax, interactiveElements: elements, consoleErrors: errors, failedRequests: failed };
+    }
+  );
+
+  add(
+    'devtools_pdf',
+    'Print the current page to PDF and return base64 data.',
+    shape({
+      tabId: tabIdSchema,
+      landscape: flag('Landscape orientation'),
+      printBackground: flag('Print background graphics (default true)'),
+      scale: { type: 'number', description: 'Print scale (0.1-2)' },
+      paperWidth: { type: 'number', description: 'Paper width in inches' },
+      paperHeight: { type: 'number', description: 'Paper height in inches' }
+    }),
+    'read-only',
+    async ({ tabId, landscape = false, printBackground = true, scale = 1, paperWidth, paperHeight }, ctx) => {
+      const session = await ctx.session(tabId);
+      const pdf = await session.printToPDF({ landscape, printBackground, scale, paperWidth, paperHeight });
+      return { sessionId: session.tab?.id, format: 'pdf', ...pdf, encoding: 'base64' };
+    }
+  );
+
+  add(
     'devtools_storage',
     'Cookies and localStorage/sessionStorage inspection and mutation. Values are redacted by default; raw export requires full-debug + DEVTOOLS_ALLOW_SENSITIVE=1 + includeSensitive=true.',
     shape({
@@ -342,6 +521,29 @@ export function registerAdvancedTools(registry) {
         failedRequests: failures.slice(-20).map(req => ({ id: req.id, url: req.url, method: req.method, status: req.status, error: req.errorText, corsError: req.corsError })),
         slowRequests: slow.slice(-10).map(req => ({ id: req.id, url: req.url, durationMs: req.durationMs }))
       };
+    }
+  );
+
+  add(
+    'devtools_storage_state',
+    'Export or restore storage state (cookies + localStorage + sessionStorage) for the current origin/tab. Raw values require full-debug + DEVTOOLS_ALLOW_SENSITIVE=1.',
+    shape({
+      tabId: tabIdSchema,
+      action: enumStr('Action', ['export', 'restore'], { default: 'export' }),
+      state: { type: 'object', description: 'Storage state object for restore', additionalProperties: true },
+      includeSensitive: flag('Include/restore raw secret values (requires full-debug + DEVTOOLS_ALLOW_SENSITIVE=1)')
+    }),
+    'interactive',
+    async ({ tabId, action = 'export', state, includeSensitive = false }, ctx) => {
+      const session = await ctx.session(tabId);
+      const sensitive = ctx.sensitive(includeSensitive === true);
+      if (action === 'export') return { sessionId: session.tab?.id, action, state: await session.storageState({ includeSensitive: sensitive }) };
+      if (action === 'restore') {
+        assertPermission(ctx.permission, 'full-debug', 'Restoring storage state');
+        if (!sensitive) throw new Error('Restoring storage state requires includeSensitive=true');
+        return { sessionId: session.tab?.id, action, result: await session.restoreStorageState(state, { includeSensitive: true }) };
+      }
+      throw new Error('Unknown storage_state action');
     }
   );
 

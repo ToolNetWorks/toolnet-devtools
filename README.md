@@ -1,4 +1,4 @@
-# ToolNet DevTools MCP v0.2.0
+# ToolNet DevTools MCP v0.3.0
 
 A dependency-free **universal Chrome DevTools MCP server** for AI coding agents. It drives any `http://` or `https://` site through the **Chrome DevTools Protocol (CDP)** and exposes Console, Network, WebSocket, DOM/CSS, Debugger, Performance, Storage and export workflows as MCP tools.
 
@@ -10,10 +10,11 @@ No Playwright, Puppeteer, Selenium, browser download, database or `npm install` 
 - **Automatic browser management** - connects to an existing CDP endpoint or launches an isolated headless Chromium when none is available.
 - **First-byte capture** - `devtools_open_url` creates a blank tab, attaches CDP and enables Network/Runtime/Log/Page *before* navigating, so the initial document and API calls are recorded.
 - **Real DevTools domains** - console errors and stack traces, request/response bodies, redirects, timing, WebSocket frames, DOM/CSS, breakpoints, paused call frames, performance metrics, tracing, CPU profiles, cookies and web storage.
+- **One-call F12 check** - `devtools_f12_check` runs the full automatic workflow and returns console errors, failed/slow requests, WebSocket activity, page state and performance metrics.
 - **No manual tab setup** - create, select, close, reload, navigate back/forward, click, type, press keys and scroll through tools.
 - **Safe defaults** - three permission tiers, loopback-only CDP endpoints, secret redaction and bounded buffers.
 - **Durable artifacts** - JSON, HAR 1.2, error report, trace and `.cpuprofile` exports inside a confined export directory.
-- **37 MCP tools** including one-call `devtools_navigate_and_capture`, JSON-RPC stdio transport, works with Codex CLI, OpenCode and other MCP clients.
+- **51 MCP tools** including `devtools_f12_check`, emulation/network control, interception/mock, accessibility/PDF/snapshot, storage-state, download/upload, drag/drop, and locator-based input actions, JSON-RPC stdio transport, works with Codex CLI, OpenCode and other MCP clients.
 
 ## Requirements
 
@@ -53,16 +54,16 @@ Ready-to-copy examples:
 ### 2. Ask the agent to open a URL
 
 ```text
-Use devtools_navigate_and_capture on https://example.com, then call devtools_diagnose.
+Use devtools_f12_check on https://example.com.
 ```
 
-You do not need to open Chrome, create a tab, navigate or reload. A single call to `devtools_navigate_and_capture` (or `devtools_open_url`) will:
+You do not need to open Chrome, create a tab, navigate or reload. A single call to `devtools_f12_check`, `devtools_navigate_and_capture`, or `devtools_open_url` will:
 
 1. Check `CDP_ENDPOINT` for a reachable browser, or auto-launch an isolated headless Chrome if needed.
 2. Create a blank tab when required.
 3. Attach CDP and enable Network/Runtime/Page/Log **before** any navigation.
-4. Navigate to the requested URL and wait for it.
-5. Return captured requests/console state and proof that Network was enabled before navigation.
+4. Navigate to the requested URL, wait for load, and optionally wait for a continuous network-quiet window so delayed XHR/fetch calls are captured.
+5. Return captured requests/console state, diagnostics, and proof that Network was enabled before navigation.
 
 The MCP server itself is a stdio process, not an interactive CLI:
 
@@ -151,7 +152,7 @@ Additional behavior:
 - Redaction is best-effort pattern matching, not a guarantee. Do not point this server at production accounts or sensitive data unless you accept that risk.
 - Keep the CDP port bound to loopback. `CDP_ALLOW_REMOTE=1` is available but strongly discouraged.
 
-## MCP tools (37)
+## MCP tools (51)
 
 Tools without a tier note are `read-only`. The current tier is shown in `devtools_status`.
 
@@ -173,17 +174,25 @@ Tools without a tier note are `read-only`. The current tier is shown in `devtool
 
 | Tool | Tier | Purpose |
 |---|---|---|
-| `devtools_navigate_and_capture` | interactive | **Primary one-call tool**: ensure Chrome, create/attach a blank tab, enable Network/Runtime/Page/Log before navigation, navigate any HTTP/HTTPS URL, wait, and return capture proof/data. |
+| `devtools_navigate_and_capture` | interactive | **Primary one-call capture tool**: ensure Chrome, create/attach a blank tab, enable Network/Runtime/Page/Log before navigation, navigate any HTTP/HTTPS URL, wait, and return capture proof/data. |
+| `devtools_f12_check` | interactive | **Primary one-call F12 check**: same automatic workflow as `devtools_navigate_and_capture`, plus performance metrics and a ready-to-read diagnostics summary. |
 | `devtools_open_url` | interactive | Alias of `devtools_navigate_and_capture` for compatibility and convenience. |
 | `devtools_new_tab` | interactive | Create a blank attached tab. |
 | `devtools_navigate` | interactive | Navigate the active or named tab (capture domains are ensured enabled). |
 | `devtools_reload` | interactive | Reload, optionally bypassing cache. |
 | `devtools_history` | interactive | Go back or forward. |
-| `devtools_click` | interactive | Click a CSS selector with trusted Chrome input events. |
+| `devtools_click` | interactive | Click by selector/xpath/text/role/testId with trusted Chrome input events. |
 | `devtools_type` | interactive | Focus and type into inputs, optionally clear and submit. |
 | `devtools_press_key` | interactive | Send Enter, Tab, Escape, arrows and modifiers. |
 | `devtools_scroll` | interactive | Wheel scrolling, optionally after `scrollIntoView`. |
-| `devtools_wait` | | Wait for a selector, JS expression, network idle or delay. |
+| `devtools_hover` | interactive | Hover by selector/xpath/text/role/testId. |
+| `devtools_dblclick` | interactive | Double-click by selector/xpath/text/role/testId. |
+| `devtools_focus` | interactive | Focus by selector/xpath/text/role/testId. |
+| `devtools_select` | interactive | Select option(s) in a `<select>` by value/text/label. |
+| `devtools_drag` | interactive | Drag-and-drop between two selectors. |
+| `devtools_upload_file` | interactive | Set files on an `<input type=file>` (paths must be visible to Chrome). |
+| `devtools_download` | interactive | Click a download trigger and capture completed files in a download directory. |
+| `devtools_wait` | | Wait for a selector/locator, JS expression, network idle or delay. |
 | `devtools_evaluate` | | Side-effect-free JS by default; `allowSideEffects=true` requires interactive. |
 | `devtools_dom_inspect` | | HTML, attributes, text, computed CSS and box model. |
 | `devtools_dom_query` | | Query matching elements with visibility and text previews. |
@@ -208,23 +217,28 @@ Tools without a tier note are `read-only`. The current tier is shown in `devtool
 | `devtools_cdp` | full-debug | Raw CDP method with destructive browser commands blocked. |
 | `devtools_debugger` | full-debug | Scripts, breakpoints, pause/resume/step, call stack, source and paused-frame evaluation. |
 | `devtools_performance` | | Metrics; tracing and CPU profiling require full-debug. |
+| `devtools_intercept` | interactive | Fetch interception rules: continue/block/mock requests. |
+| `devtools_emulate` | interactive | Viewport/user-agent/locale/timezone/geolocation/media, network throttling/offline/cache/headers/blocking. |
+| `devtools_accessibility` | | Accessibility tree snapshot for semantic discovery. |
+| `devtools_snapshot` | | Agent-friendly page snapshot: page info, AX summary, interactive elements, console/network errors. |
+| `devtools_pdf` | | Print current page to PDF (base64). |
 | `devtools_storage` | interactive | Cookies/localStorage/sessionStorage list; raw values and mutations require full-debug. |
+| `devtools_storage_state` | interactive | Export/restore cookies + local/session storage (restore requires sensitive gate). |
 | `devtools_capture` | interactive | Mark a capture window, then stop and summarize its requests/errors. |
 | `devtools_export` | | Write JSON, HAR 1.2, error report, trace or CPU profile. |
 
 ## Recommended workflows
 
-### Capture a page from the first byte
+### One-call F12 check
 
 ```text
-devtools_navigate_and_capture { "url": "https://app.example.test/", "waitUntil": "load", "settleMs": 500 }
-devtools_diagnose             { "slowMs": 1500 }
-devtools_network              { "onlyFailed": true }
-devtools_request              { "requestId": "<id>" }
-devtools_response_body        { "requestId": "<id>" }
+devtools_f12_check { "url": "https://app.example.test/", "waitUntil": "load", "settleMs": 300, "networkIdleWaitMs": 1000 }
+devtools_request   { "requestId": "<id>" }
+devtools_response_body { "requestId": "<id>" }
+devtools_export    { "format": "har", "includeBodies": true, "path": "app.har" }
 ```
 
-`devtools_navigate_and_capture` (or `devtools_open_url`) creates/attaches a blank tab and enables Network/Runtime/Page/Log before navigation, so the document request and early API/XHR calls are present. The result includes `captureReadiness`, `navigation.navigationStartedAt` and `verified.networkEnabledBeforeNavigation` to prove capture was armed first. Use `devtools_network_search` or `devtools_network` with `bodyContains` when you only know a response value.
+`devtools_f12_check` (and `devtools_navigate_and_capture`/`devtools_open_url`) creates/attaches a blank tab and enables Network/Runtime/Page/Log before navigation, so document and early API/XHR calls are present. The result includes `captureReadiness`, `navigation.navigationStartedAt`, `verified.networkEnabledBeforeNavigation`, and `f12` diagnostics with console errors, failed/slow requests, WebSocket activity, and performance metrics. Use `devtools_network_search` or `devtools_network` with `bodyContains` when you only know a response value.
 
 ### Follow live activity
 

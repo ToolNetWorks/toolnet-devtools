@@ -82,6 +82,7 @@ export async function createFixtureServer() {
   <button id="go" type="button">Go</button>
   <div id="result">waiting</div>
   <a id="second-link" href="/second">Second page</a>
+  <a id="popup-link" href="/second" target="_blank" rel="noopener">Open second page in a new tab</a>
   <div id="tall" style="height:2400px;background:linear-gradient(#fff,#eee)"></div>
   <script>
     window.fixtureDebug = function fixtureDebug(a, b) {
@@ -120,6 +121,24 @@ export async function createFixtureServer() {
     }
     if (url.pathname === '/second') {
       send(200, '<!doctype html><html><head><title>Fixture Second</title></head><body><h1>Second</h1><p id="second">second-page</p></body></html>');
+      return;
+    }
+    if (url.pathname === '/delayed') {
+      send(200, `<!doctype html><html><head><title>Fixture Delayed</title></head><body>
+        <div id="result">waiting</div>
+        <script>
+          setTimeout(() => {
+            fetch('/api/delayed').then(r => r.json()).then(data => {
+              document.querySelector('#result').textContent = 'delayed:' + data.ok;
+              console.log('delayed-loaded', data.ok);
+            }).catch(error => console.error('delayed-failed', String(error)));
+          }, 700);
+        </script>
+      </body></html>`);
+      return;
+    }
+    if (url.pathname === '/api/delayed') {
+      send(200, JSON.stringify({ ok: true, secret: 'delayed-secret', items: ['a', 'b'] }), 'application/json');
       return;
     }
     if (url.pathname === '/api/data') {

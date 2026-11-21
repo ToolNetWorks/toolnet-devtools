@@ -5,7 +5,7 @@ export function registerSessionTools(registry) {
 
   add(
     'devtools_tabs',
-    'List Chrome page tabs. If no Chrome is reachable and auto-launch is enabled, a headless Chromium is started automatically. No manual tab opening is required.',
+    'List Chrome page tabs. If no Chrome is reachable and auto-launch is enabled, a headless Chromium is started automatically. For a new URL or an F12 check, call devtools_navigate_and_capture or devtools_f12_check instead of opening a tab manually.',
     shape(),
     'read-only',
     async (_args, ctx) => {
@@ -16,7 +16,7 @@ export function registerSessionTools(registry) {
 
   add(
     'devtools_attach',
-    'Attach CDP to an existing tab and immediately enable Network/Runtime/Log/Page capture. Use devtools_open_url to create a new tab and navigate without missing initial requests.',
+    'Low-level: attach CDP to an existing tab (or an automatically created about:blank tab) and enable Network/Runtime/Log/Page capture. It cannot recover requests that happened before attachment. For any new URL or F12 check, call devtools_navigate_and_capture or devtools_f12_check first so capture starts before navigation.',
     shape({ tabId: tabIdSchema }),
     'read-only',
     async ({ tabId }, ctx) => {

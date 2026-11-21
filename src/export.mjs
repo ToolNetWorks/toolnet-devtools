@@ -2,7 +2,7 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { redactHeaders, redactText, redactUrl, safeResponseBody } from './security.mjs';
 
-const HAR_CREATOR = { name: 'toolnet-devtools-mcp', version: '0.2.0' };
+const HAR_CREATOR = { name: 'toolnet-devtools-mcp', version: '0.3.0' };
 const MAX_EXPORT_BYTES = 64_000_000;
 
 function round(value, digits = 2) {
@@ -135,7 +135,9 @@ export async function buildHar(session, {
         cookies: [],
         headers: headerArray(responseHeaders),
         content,
-        redirectURL: req.redirectResponse?.headers?.location ?? req.redirectResponse?.headers?.Location ?? '',
+        redirectURL: includeSensitive && req.redirectResponseLocationRaw
+          ? req.redirectResponseLocationRaw
+          : redactUrl(req.redirectResponse?.location ?? ''),
         headersSize: -1,
         bodySize: req.bytes ?? 0,
         _failed: req.failed === true,

@@ -4,6 +4,7 @@ import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { ChromeSession, LIMITS, sleep } from './cdp.mjs';
+import { buildSessionDiagnostics } from './diagnostics.mjs';
 import {
   isAllowedEndpoint,
   normalizeEndpoint,
@@ -69,6 +70,8 @@ function chromeArgs({ port, profileDir, headlessFlag, endpoint }) {
     '--disable-component-update',
     '--disable-sync',
     '--disable-extensions',
+    '--disable-popup-blocking',
+    '--disable-notifications',
     '--disable-background-timer-throttling',
     '--disable-renderer-backgrounding',
     '--disable-backgrounding-occluded-windows',
@@ -192,7 +195,16 @@ export class BrowserManager {
         const child = spawn(binary, args, { stdio: ['ignore', 'ignore', 'pipe'] });
         this.launchProcess = child;
         this.launchedByUs = true;
+        let spawnError = null;
         const logStream = fs.createWriteStream(this.launchLogPath, { flags: 'a' });
+        child.once('error', error => {
+          spawnError = error;
+          logStream.write(`[spawn error] ${error?.message ?? String(error)}\n`);
+          if (this.launchProcess === child) {
+            this.launchProcess = null;
+            this.launchedByUs = false;
+          }
+        });
         child.stderr?.on('data', chunk => {
           if (process.env.DEVTOOLS_DEBUG === '1') this.logger?.error?.(String(chunk).trim().slice(0, 1000));
           logStream.write(chunk);
@@ -207,8 +219,13 @@ export class BrowserManager {
           }
           if (process.env.DEVTOOLS_DEBUG === '1') this.logger?.error?.(`[toolnet-devtools] Chrome exited (${code ?? signal})`);
         });
-        const ready = await this.waitForEndpoint({ child, timeoutMs: Number(process.env.DEVTOOLS_LAUNCH_TIMEOUT || 20_000) });
+        const ready = await this.waitForEndpoint({
+          child,
+          timeoutMs: Number(process.env.DEVTOOLS_LAUNCH_TIMEOUT || 20_000),
+          getSpawnError: () => spawnError
+        });
         if (ready) return ready;
+        if (spawnError) throw spawnError;
         lastError = new Error(`Chrome did not expose ${this.endpoint} within the launch timeout`);
         if (!exitCode && child.exitCode == null) {
           try { child.kill('SIGTERM'); } catch { /* ignore */ }
@@ -224,9 +241,10 @@ export class BrowserManager {
     );
   }
 
-  async waitForEndpoint({ child, timeoutMs }) {
+  async waitForEndpoint({ child, timeoutMs, getSpawnError = () => null }) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
+      if (getSpawnError()) return null;
       if (child.exitCode != null) return null;
       const info = await this.checkReachable({ force: true, timeoutMs: 1000 });
       if (info) return info;
@@ -257,8 +275,10 @@ export class BrowserManager {
         tab: session.tab,
         connected: session.connected,
         requests: session.requests.size,
+        requestLogEntries: session.requestLog.items.length,
         consoleEntries: session.console.items.length,
-        websocketFrames: session.frames.items.length
+        websocketFrames: session.frames.items.length,
+        captureReadiness: { ...session.captureReadiness }
       }))
     };
   }
@@ -268,28 +288,33 @@ export class BrowserManager {
     const existing = tabId ? this.sessions.get(tabId) : null;
     if (existing?.connected && !fresh) {
       this.activeTabId = tabId;
+      await existing.ensureCaptureEnabled();
       return existing.status();
     }
     const targets = await this.transport.tabs();
-    const target = tabId ? targets.find(tab => tab.id === tabId) : targets[0];
-    if (!target) throw new Error(tabId ? `Tab ${tabId} not found` : 'No page tab available. Call devtools_open_url or devtools_new_tab.');
+    let target = tabId
+      ? targets.find(tab => tab.id === tabId)
+      : (targets.find(tab => tab.id === this.activeTabId) ?? targets[0]);
+    // A fresh browser may expose no page targets at all. Creating an
+    // about:blank tab here is what makes devtools_attach safe to call first.
+    if (!target) target = await this.transport.createTab('about:blank');
+    if (!target) throw new Error(tabId ? `Tab ${tabId} not found` : 'Chrome did not provide a page target');
     if (existing) await existing.close();
     const session = new ChromeSession(this.endpoint, this.sessionOptions());
-    await session.attach(target.id, { fresh });
+    await session.attach(target.id, { fresh, target });
     this.sessions.set(target.id, session);
     this.activeTabId = target.id;
     return session.status();
   }
 
   async attachFirstPage({ fresh = true } = {}) {
+    await this.ensureBrowser();
     const targets = await this.transport.tabs();
     let target = this.activeTabId ? targets.find(tab => tab.id === this.activeTabId) : null;
     if (!target) target = targets[0];
-    if (!target) {
-      target = await this.transport.createTab('about:blank');
-    }
+    if (!target) target = await this.transport.createTab('about:blank');
     const session = new ChromeSession(this.endpoint, this.sessionOptions());
-    await session.attach(target.id, { fresh });
+    await session.attach(target.id, { fresh, target });
     this.sessions.set(target.id, session);
     this.activeTabId = target.id;
     return session;
@@ -301,29 +326,34 @@ export class BrowserManager {
       const session = this.sessions.get(tabId);
       if (session?.connected) {
         this.activeTabId = tabId;
+        await session.ensureCaptureEnabled();
         return session;
       }
       const targets = await this.transport.tabs();
       const target = targets.find(tab => tab.id === tabId);
       if (!target) throw new Error(`Tab ${tabId} not found. Call devtools_tabs for current tabs.`);
       if (session) {
-        await session.attach(tabId, { fresh: false });
+        await session.attach(tabId, { fresh: false, target });
         this.activeTabId = tabId;
         return session;
       }
       const created = new ChromeSession(this.endpoint, this.sessionOptions());
-      await created.attach(tabId, { fresh: true });
+      await created.attach(tabId, { fresh: true, target });
       this.sessions.set(tabId, created);
       this.activeTabId = tabId;
       return created;
     }
     if (this.activeTabId) {
       const active = this.sessions.get(this.activeTabId);
-      if (active?.connected) return active;
+      if (active?.connected) {
+        await active.ensureCaptureEnabled();
+        return active;
+      }
     }
     for (const [id, session] of this.sessions) {
       if (session.connected) {
         this.activeTabId = id;
+        await session.ensureCaptureEnabled();
         return session;
       }
     }
@@ -332,20 +362,43 @@ export class BrowserManager {
 
   async newTab({ activate = true } = {}) {
     await this.ensureBrowser();
-    const target = await this.transport.createTab('about:blank');
+    let target = await this.transport.createTab('about:blank');
+    if (!target) throw new Error('Chrome did not create a new page target');
     const session = new ChromeSession(this.endpoint, this.sessionOptions());
-    await session.attach(target.id, { fresh: true });
+    try {
+      await session.attach(target.id, { fresh: true, target });
+    } catch (error) {
+      // /json/new can return before the target is visible in /json/list.
+      // Give Chrome a moment, then resolve the target by URL and retry once.
+      await sleep(150);
+      const targets = await this.transport.tabs();
+      target = targets.find(tab => tab.id === target.id)
+        ?? targets.find(tab => tab.url === 'about:blank' && !this.sessions.has(tab.id));
+      if (!target) throw error;
+      await session.attach(target.id, { fresh: true, target });
+    }
     this.sessions.set(target.id, session);
     this.activeTabId = target.id;
     if (activate) await this.transport.activateTab(target.id).catch(() => {});
     return { sessionId: target.id, tab: session.tab, capture: session.status() };
   }
 
-  async openUrl(rawUrl, { newTab = true, waitUntil = 'load', timeoutMs = 30_000, settleMs = 400, clearFirst = true } = {}) {
-    return await this.navigateAndCapture(rawUrl, { newTab, waitUntil, timeoutMs, settleMs, clearFirst });
+  async openUrl(rawUrl, options = {}) {
+    return await this.navigateAndCapture(rawUrl, options);
   }
 
-  async navigateAndCapture(rawUrl, { tabId = null, newTab = true, waitUntil = 'load', timeoutMs = 30_000, settleMs = 400, clearFirst = true } = {}) {
+  async navigateAndCapture(rawUrl, {
+    tabId = null,
+    newTab = true,
+    waitUntil = 'load',
+    timeoutMs = 30_000,
+    settleMs = 400,
+    networkIdleWaitMs = 1000,
+    clearFirst = true,
+    slowMs = 1500,
+    includeDiagnostics = true,
+    requestLimit = 50
+  } = {}) {
     const url = normalizePageUrl(rawUrl);
     const lockKey = tabId ?? (newTab ? `navigate-and-capture-${Date.now()}-${Math.random().toString(16).slice(2)}` : 'navigate-and-capture-active');
     return await this.withLock(lockKey, async () => {
@@ -364,12 +417,36 @@ export class BrowserManager {
         if (clearFirst) session.clearAll();
       }
       if (!session) throw new Error('Unable to create or attach a page session');
+
+      // Capture domains must be live before Page.navigate. attach() already
+      // enables them, and this second call is an explicit readiness barrier.
       const captureReadiness = await session.ensureCaptureEnabled();
       const readinessBeforeNavigation = { ...captureReadiness };
+      const requestCountBefore = session.requestLog.items.length;
       const navigation = await session.navigate(url, { waitUntil, timeoutMs });
       this.activeTabId = session.tab?.id ?? this.activeTabId;
       if (settleMs > 0) await sleep(Math.min(10_000, Number(settleMs) || 0));
+      let networkIdleReached = null;
+      const quietWindow = Math.max(0, Number(networkIdleWaitMs) || 0);
+      if (quietWindow > 0) {
+        // Wait for a continuous quiet window instead of a single instant.
+        // This catches XHR/fetch calls scheduled shortly after load (analytics,
+        // hydration, lazy data) without requiring a manual reload.
+        networkIdleReached = await session.waitForNetworkIdle({
+          idleMs: Math.max(100, quietWindow),
+          timeoutMs: Math.min(15_000, Math.max(2000, quietWindow * 2))
+        });
+      }
       const capture = session.status();
+      const diagnostics = includeDiagnostics
+        ? buildSessionDiagnostics(session, {
+            slowMs,
+            requestLimit,
+            consoleLimit: 20,
+            websocketLimit: 10,
+            includeRequests: true
+          })
+        : undefined;
       return {
         sessionId: session.tab?.id,
         tab: session.tab,
@@ -387,11 +464,16 @@ export class BrowserManager {
           readyAt: readinessBeforeNavigation.readyAt,
           navigationStartedAt: navigation.navigationStartedAt
         },
+        requestCountBefore,
+        requestCountAfter: session.requestLog.items.length,
+        networkIdleReached,
         capture,
+        diagnostics,
         nextSteps: [
-          'Call devtools_diagnose for a quick error/network summary.',
+          'The returned diagnostics already summarize console errors, failed/slow requests, WebSocket activity and page state.',
           'Call devtools_console or devtools_network with afterSequence to inspect new activity.',
-          'Call devtools_export with format har to write a forensic capture file.'
+          'Call devtools_request and devtools_response_body for a specific request.',
+          'Call devtools_export with format har or format report to write a forensic capture file.'
         ]
       };
     });
@@ -400,6 +482,7 @@ export class BrowserManager {
   async selectTab(tabId) {
     await this.ensureBrowser();
     const session = await this.sessionFor(tabId);
+    await session.ensureCaptureEnabled();
     this.activeTabId = tabId;
     await this.transport.activateTab(tabId).catch(() => {});
     return { selected: tabId, tab: session.tab, capture: session.status() };
@@ -420,21 +503,51 @@ export class BrowserManager {
     return { closed: tabId, activeTabId: this.activeTabId };
   }
 
-  async navigate(rawUrl, { tabId = null, waitUntil = 'load', timeoutMs = 30_000 } = {}) {
+  async navigate(rawUrl, { tabId = null, waitUntil = 'load', timeoutMs = 30_000, networkIdleWaitMs = 0 } = {}) {
     const url = normalizePageUrl(rawUrl);
     const session = await this.sessionFor(tabId);
     await session.ensureCaptureEnabled();
-    return { sessionId: session.tab?.id, tab: session.tab, navigation: await session.navigate(url, { waitUntil, timeoutMs }), capture: session.status() };
+    const requestCountBefore = session.requestLog.items.length;
+    const navigation = await session.navigate(url, { waitUntil, timeoutMs });
+    let networkIdleReached = null;
+    const quietWindow = Math.max(0, Number(networkIdleWaitMs) || 0);
+    if (quietWindow > 0) {
+      networkIdleReached = await session.waitForNetworkIdle({
+        idleMs: Math.max(100, quietWindow),
+        timeoutMs: Math.min(15_000, Math.max(2000, quietWindow * 2))
+      });
+    }
+    return {
+      sessionId: session.tab?.id,
+      tab: session.tab,
+      navigation,
+      requestCountBefore,
+      requestCountAfter: session.requestLog.items.length,
+      networkIdleReached,
+      capture: session.status(),
+      diagnostics: buildSessionDiagnostics(session, { includeRequests: true, requestLimit: 30 })
+    };
   }
 
   async reload({ tabId = null, ignoreCache = false, waitUntil = 'load', timeoutMs = 30_000 } = {}) {
     const session = await this.sessionFor(tabId);
-    return { sessionId: session.tab?.id, ...(await session.reload({ ignoreCache, waitUntil, timeoutMs })) };
+    const result = await session.reload({ ignoreCache, waitUntil, timeoutMs });
+    return {
+      sessionId: session.tab?.id,
+      ...result,
+      capture: session.status(),
+      diagnostics: buildSessionDiagnostics(session, { includeRequests: true, requestLimit: 30 })
+    };
   }
 
   async history(direction, { tabId = null, waitUntil = 'load', timeoutMs = 30_000 } = {}) {
     const session = await this.sessionFor(tabId);
-    return { sessionId: session.tab?.id, ...(await session.history(direction, { waitUntil, timeoutMs })) };
+    await session.ensureCaptureEnabled();
+    return {
+      sessionId: session.tab?.id,
+      ...(await session.history(direction, { waitUntil, timeoutMs })),
+      capture: session.status()
+    };
   }
 
   async withLock(key, fn) {

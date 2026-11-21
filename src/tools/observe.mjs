@@ -1,3 +1,4 @@
+import { buildSessionDiagnostics } from '../diagnostics.mjs';
 import { looksTextual, redactText } from '../security.mjs';
 import { enumStr, flag, num, result, shape, str, tabIdSchema } from './registry.mjs';
 
@@ -206,11 +207,11 @@ export function registerObserveTools(registry) {
       const req = session.requests.get(requestId) ?? recordsFor(session).find(item => item.id === requestId);
       if (!req) throw new Error('Request not retained. Reproduce it after attaching, or increase the request buffer.');
       const sensitive = ctx.sensitive(includeSensitive);
-      const { body, headersRaw, responseHeadersRaw, postDataRaw, urlRaw, ...record } = req;
+      const { body, headersRaw, responseHeadersRaw, postDataRaw, urlRaw, redirectResponseLocationRaw, ...record } = req;
       return {
         sessionId: session.tab?.id,
         ...record,
-        ...(sensitive ? { urlRaw, headersRaw, responseHeadersRaw, postDataRaw } : {}),
+        ...(sensitive ? { urlRaw, headersRaw, responseHeadersRaw, postDataRaw, redirectResponseLocationRaw } : {}),
         body: body ? { binary: body.binary, truncated: body.truncated, originalChars: body.originalChars, cached: true } : undefined
       };
     }
@@ -297,45 +298,15 @@ export function registerObserveTools(registry) {
     'read-only',
     async ({ tabId, slowMs = 1500 }, ctx) => {
       const session = await ctx.session(tabId);
-      const threshold = Math.max(1, Math.min(120_000, slowMs));
-      const requests = [...session.requests.values()];
-      const failures = requests.filter(req => req.failed || (req.status ?? 0) >= 400);
-      const slow = requests.filter(req => (req.durationMs ?? 0) >= threshold);
-      const errors = session.console.items.filter(entry => entry.level === 'error' || entry.category === 'exception');
-      const warnings = session.console.items.filter(entry => entry.level === 'warning');
       return {
         sessionId: session.tab?.id,
-        page: session.pageState,
-        summary: {
-          consoleErrors: errors.length,
-          consoleWarnings: warnings.length,
-          failedRequests: failures.length,
-          slowRequests: slow.length,
-          capturedRequests: requests.length,
-          websocketConnections: session.wsConnections.size,
-          websocketFrames: session.frames.items.length,
-          pendingRequests: session.pendingRequestCount(),
-          paused: session.paused != null,
-          dialogs: session.dialogs.items.filter(dialog => !dialog.handled).length
-        },
-        errors: errors.slice(-20),
-        warnings: warnings.slice(-10),
-        failedRequests: failures.slice(-30).map(req => ({
-          id: req.id, url: req.url, method: req.method, type: req.resourceType,
-          status: req.status, reason: req.errorText, corsError: req.corsError,
-          durationMs: req.durationMs, redirectChain: req.redirectChain
-        })),
-        slowRequests: slow.slice(-15).map(req => ({
-          id: req.id, url: req.url, method: req.method, type: req.resourceType,
-          status: req.status, durationMs: req.durationMs, bytes: req.bytes
-        })),
-        websocketErrors: [...session.wsConnections.values()].filter(connection => connection.lastError),
-        dialogs: session.dialogs.items.filter(dialog => !dialog.handled),
-        suggestedNextSteps: [
-          'Inspect specific requests with devtools_request and devtools_response_body.',
-          'Poll devtools_console/devtools_network with afterSequence to follow new activity.',
-          'Export with devtools_export format=har or format=report for a durable artifact.'
-        ]
+        ...buildSessionDiagnostics(session, {
+          slowMs,
+          requestLimit: 50,
+          consoleLimit: 20,
+          websocketLimit: 10,
+          includeRequests: true
+        })
       };
     }
   );

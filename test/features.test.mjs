@@ -188,12 +188,18 @@ test('tool registry exposes all required DevTools domains with permission tiers'
   registerTools(registry);
   const names = registry.list().map(tool => tool.name);
   for (const name of [
-    'devtools_navigate_and_capture', 'devtools_open_url', 'devtools_navigate', 'devtools_reload', 'devtools_history',
-    'devtools_click', 'devtools_type', 'devtools_scroll', 'devtools_tabs', 'devtools_select_tab',
-    'devtools_console', 'devtools_network', 'devtools_websocket', 'devtools_dom_inspect',
-    'devtools_debugger', 'devtools_performance', 'devtools_storage', 'devtools_export',
+    'devtools_f12_check', 'devtools_navigate_and_capture', 'devtools_open_url', 'devtools_navigate', 'devtools_reload', 'devtools_history',
+    'devtools_click', 'devtools_type', 'devtools_scroll', 'devtools_hover', 'devtools_dblclick', 'devtools_focus', 'devtools_select', 'devtools_drag', 'devtools_upload_file', 'devtools_download',
+    'devtools_tabs', 'devtools_select_tab',
+    'devtools_console', 'devtools_network', 'devtools_websocket', 'devtools_dom_inspect', 'devtools_accessibility', 'devtools_snapshot',
+    'devtools_debugger', 'devtools_performance', 'devtools_intercept', 'devtools_emulate', 'devtools_storage', 'devtools_storage_state', 'devtools_export', 'devtools_pdf',
     'devtools_cdp', 'devtools_diagnose', 'devtools_capture', 'devtools_screenshot'
   ]) assert.ok(names.includes(name), `missing ${name}`);
+  assert.equal(names[0], 'devtools_navigate_and_capture', 'primary workflow must be listed first');
+  assert.equal(registry.get('devtools_f12_check').minPermission, 'interactive');
+  assert.equal(registry.get('devtools_emulate').minPermission, 'interactive');
+  assert.equal(registry.get('devtools_accessibility').minPermission, 'read-only');
+  assert.equal(registry.get('devtools_pdf').minPermission, 'read-only');
   assert.equal(registry.get('devtools_open_url').minPermission, 'interactive');
   assert.equal(registry.get('devtools_debugger').minPermission, 'full-debug');
   assert.equal(registry.get('devtools_console').minPermission, 'read-only');

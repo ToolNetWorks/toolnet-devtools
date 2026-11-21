@@ -10,9 +10,9 @@
 export const PERMISSIONS = Object.freeze(['read-only', 'interactive', 'full-debug']);
 const PERMISSION_LEVEL = Object.freeze({ 'read-only': 0, interactive: 1, 'full-debug': 2 });
 
-const SECRET_HEADER = /^(authorization|proxy-authorization|cookie|set-cookie|x-api-key|x-auth-token|x-csrf-token|x-xsrf-token|x-amz-security-token|x-goog-api-key|x-goog-auth-user|x-access-token)$/i;
-const SECRET_FIELD = /^(password|passwd|pwd|secret|client[_-]?secret|api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?id|private[_-]?key|token|authorization|cookie|set-cookie)$/i;
-const SECRET_QUERY = /^(password|passwd|pwd|secret|client[_-]?secret|api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?id|token|auth|authorization|signature|sig|key|code)$/i;
+const SECRET_HEADER = /^(authorization|proxy-authorization|cookie|set-cookie|x-api-key|x-auth-token|x-access-token|x-refresh-token|x-session-id|x-csrf-token|x-xsrf-token|x-amz-security-token|x-goog-api-key|x-goog-auth-user|x-goog-auth-token)$/i;
+const SECRET_FIELD = /^(password|passwd|pwd|secret|client[_-]?secret|api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?id|sessionid|session|private[_-]?key|token|authorization|cookie|set-cookie|jwt|bearer|csrf|xsrf|auth)$/i;
+const SECRET_QUERY = /^(password|passwd|pwd|secret|client[_-]?secret|api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?id|sessionid|session|token|auth|auth_token|authorization|signature|sig|key|code|jwt|bearer|cookie|csrf|xsrf)$/i;
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]', '::1']);
 const HTTP_PROTOCOLS = new Set(['http:', 'https:']);
 
@@ -120,7 +120,12 @@ export function isAllowedWebSocket(raw, endpoint) {
   try {
     const ws = new URL(raw);
     const base = new URL(endpoint);
-    if (ws.protocol !== 'ws:' || ws.port !== base.port) return false;
+    if (ws.protocol !== 'ws:' && ws.protocol !== 'wss:') return false;
+    const wsPort = ws.port || (ws.protocol === 'wss:' ? '443' : '80');
+    const basePort = base.port || (base.protocol === 'https:' ? '443' : '80');
+    if (wsPort !== basePort) return false;
+    // Chrome may report 127.0.0.1 even when the configured endpoint is
+    // localhost (or vice versa). Both are loopback and therefore equivalent.
     if (localHost(ws.hostname) && localHost(base.hostname)) return true;
     return ws.hostname === base.hostname;
   } catch {
@@ -132,10 +137,11 @@ export function redactText(text, max = 8000) {
   if (text == null) return '';
   return String(text)
     .slice(0, max)
-    .replace(/\bBearer\s+[^\s"']+/gi, 'Bearer [REDACTED]')
+    .replace(/\b(Bearer|Digest)\s+[A-Za-z0-9._~+/=-]+/gi, '$1 [REDACTED]')
     .replace(/\b(Basic)\s+[A-Za-z0-9+/=]+/gi, '$1 [REDACTED]')
-    .replace(/(["']?(?:password|passwd|pwd|secret|client[_-]?secret|api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?id|private[_-]?key|token|authorization)["']?\s*[:=]\s*["']?)[^"'\s,}\]]+/gi, '$1[REDACTED]')
-    .replace(/([?&](?:password|passwd|pwd|secret|client[_-]?secret|api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?id|token|auth|authorization|signature|sig|key|code)=)[^&\s"']+/gi, '$1[REDACTED]');
+    .replace(/((?:^|[\s,;])(?:cookie|set-cookie)\s*[:=]\s*)[^\n\r]+/gi, '$1[REDACTED]')
+    .replace(/(["']?(?:password|passwd|pwd|secret|client[_-]?secret|api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?id|sessionid|session|private[_-]?key|token|authorization|cookie|set-cookie|jwt|bearer|csrf|xsrf|auth)["']?\s*[:=]\s*["']?)[^"'\s,}\]]+/gi, '$1[REDACTED]')
+    .replace(/([?&](?:password|passwd|pwd|secret|client[_-]?secret|api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|id[_-]?token|session[_-]?id|sessionid|session|token|auth|auth_token|authorization|signature|sig|key|code|jwt|bearer|cookie|csrf|xsrf)=)[^&\s"']+/gi, '$1[REDACTED]');
 }
 
 function redactHeaderValue(value, includeSensitive) {

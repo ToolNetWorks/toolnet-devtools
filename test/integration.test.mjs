@@ -76,7 +76,7 @@ test('real Chromium 127.0.0.1:9222 end-to-end F12 workflow', { timeout: 180_000 
       assert.ok(list.tools.length >= 30, `expected >=30 tools, got ${list.tools.length}`);
       const names = list.tools.map(tool => tool.name);
       for (const required of [
-        'devtools_navigate_and_capture', 'devtools_open_url', 'devtools_console', 'devtools_network',
+        'devtools_f12_check', 'devtools_navigate_and_capture', 'devtools_open_url', 'devtools_console', 'devtools_network',
         'devtools_debugger', 'devtools_performance', 'devtools_storage', 'devtools_export'
       ]) {
         assert.ok(names.includes(required), `missing ${required}`);
@@ -373,6 +373,66 @@ test('real Chromium 127.0.0.1:9222 end-to-end F12 workflow', { timeout: 180_000 
       await closeTab(result.sessionId);
     });
 
+    await t.test('devtools_f12_check returns a complete one-call F12 report', async () => {
+      const result = await client.call('devtools_f12_check', {
+        url: fixture.origin + '/',
+        waitUntil: 'load',
+        settleMs: 200,
+        networkIdleWaitMs: 1000
+      });
+      opened.add(result.sessionId);
+      assert.equal(result.createdNewTab, true);
+      assert.equal(result.navigation.title, 'Fixture Home');
+      assert.equal(result.verified.networkEnabledBeforeNavigation, true);
+      assert.equal(result.verified.runtimeEnabledBeforeNavigation, true);
+      assert.equal(result.verified.pageEnabledBeforeNavigation, true);
+      assert.ok(Date.parse(result.captureReadiness.networkEnabledAt) <= Date.parse(result.navigation.navigationStartedAt));
+      assert.ok(result.f12, 'f12 report is present');
+      assert.ok(result.f12.summary.capturedRequests >= 3);
+      assert.ok(result.f12.summary.consoleErrors >= 1);
+      assert.ok(result.f12.errors.some(entry => /fixture-uncaught/.test(entry.text)));
+      assert.equal(typeof result.f12.performance.JSHeapUsedSize, 'number');
+      assert.ok(result.f12.requests.some(req => req.url.endsWith('/api/data')));
+      await closeTab(result.sessionId);
+    });
+
+    await t.test('delayed XHR is captured without a manual reload', async () => {
+      const result = await client.call('devtools_navigate_and_capture', {
+        url: fixture.origin + '/delayed',
+        waitUntil: 'load',
+        settleMs: 0,
+        networkIdleWaitMs: 1500
+      });
+      opened.add(result.sessionId);
+      assert.equal(result.navigation.title, 'Fixture Delayed');
+      assert.equal(result.verified.networkEnabledBeforeNavigation, true);
+      assert.ok(result.diagnostics.requests.some(req => req.url.endsWith('/api/delayed')), 'delayed fetch must be captured');
+      assert.ok(result.diagnostics.requests.some(req => req.url.endsWith('/api/delayed') && req.status === 200));
+      await closeTab(result.sessionId);
+    });
+
+    await t.test('click can open a new tab and devtools_select_tab attaches its own capture session', async () => {
+      await client.call('devtools_navigate', { url: fixture.origin + '/', tabId: tab, waitUntil: 'load' });
+      const before = await client.call('devtools_tabs');
+      const clicked = await client.call('devtools_click', { tabId: tab, selector: '#popup-link', settleMs: 300 });
+      assert.equal(clicked.clicked, true);
+      assert.ok(clicked.openedWindow, 'Page.windowOpen should be observed');
+      const found = await waitFor(async () => {
+        const current = await client.call('devtools_tabs');
+        return current.tabs.some(item => item.id !== tab && !before.tabs.some(old => old.id === item.id));
+      }, 5000, 100);
+      assert.equal(found, true, 'a new tab should be created');
+      const tabs = await client.call('devtools_tabs');
+      const newTab = tabs.tabs.find(item => item.id !== tab && !before.tabs.some(old => old.id === item.id));
+      const selected = await client.call('devtools_select_tab', { tabId: newTab.id });
+      assert.equal(selected.selected, newTab.id);
+      assert.equal(selected.capture.captureReadiness.networkEnabled, true);
+      const page = await client.call('devtools_page', { tabId: newTab.id });
+      assert.equal(page.title, 'Fixture Second');
+      await closeTab(newTab.id);
+      await client.call('devtools_select_tab', { tabId: tab });
+    });
+
     await t.test('tabs and status expose isolated sessions and permission tier', async () => {
       const tabs = await client.call('devtools_tabs');
       assert.ok(tabs.tabs.some(item => item.id === tab));
@@ -381,6 +441,7 @@ test('real Chromium 127.0.0.1:9222 end-to-end F12 workflow', { timeout: 180_000 
       assert.equal(status.activeSession.connected, true);
       assert.ok(status.activeSession.captureReadiness.networkEnabled, true);
       assert.ok(status.browser.browser.length > 0);
+      assert.equal(status.serverVersion, '0.3.0');
     });
   } finally {
     for (const tabId of opened) await closeTab(tabId);
@@ -412,6 +473,50 @@ test('read-only permission blocks navigation but still allows observation', { ti
     assert.match(sideEffect.content[0].text, /interactive/);
   } finally {
     await client.close();
+  }
+});
+
+test('interactive permission runs the complete F12 workflow without full-debug', { timeout: 120_000 }, async t => {
+  if (!chromeReady) {
+    t.skip(`Chrome is not reachable at ${MAIN_ENDPOINT}`);
+    return;
+  }
+  const fixture = await createFixtureServer();
+  const client = new McpClient({
+    env: { CDP_ENDPOINT: MAIN_ENDPOINT, DEVTOOLS_PERMISSION: 'interactive', DEVTOOLS_AUTO_LAUNCH: '0' }
+  });
+  let tab = null;
+  try {
+    await client.initialize();
+    const result = await client.call('devtools_f12_check', {
+      url: fixture.origin + '/',
+      waitUntil: 'load',
+      settleMs: 200,
+      networkIdleWaitMs: 800
+    });
+    tab = result.sessionId;
+    assert.equal(result.verified.networkEnabledBeforeNavigation, true);
+    assert.ok(result.f12.summary.capturedRequests >= 3);
+    assert.ok(result.f12.requests.some(req => req.url.endsWith('/api/data')));
+    const typed = await client.call('devtools_type', { tabId: tab, selector: '#name', text: 'Interactive', clear: true });
+    assert.equal(typed.value, 'Interactive');
+    await client.call('devtools_click', { tabId: tab, selector: '#go', settleMs: 200 });
+    const evaluated = await client.call('devtools_evaluate', {
+      tabId: tab,
+      expression: '(() => { const el = document.querySelector("#result"); el.dataset.mode = "interactive"; return el.textContent; })()',
+      allowSideEffects: true
+    });
+    assert.equal(evaluated.result, 'clicked:Interactive');
+    const debuggerDenied = await client.callRaw('devtools_debugger', { action: 'enable', tabId: tab });
+    assert.equal(debuggerDenied.isError, true);
+    assert.match(debuggerDenied.content[0].text, /full-debug/);
+    const cdpDenied = await client.callRaw('devtools_cdp', { tabId: tab, method: 'Page.getNavigationHistory' });
+    assert.equal(cdpDenied.isError, true);
+    assert.match(cdpDenied.content[0].text, /full-debug/);
+  } finally {
+    if (tab) await client.call('devtools_close_tab', { tabId: tab }).catch(() => {});
+    await client.close();
+    await fixture.close();
   }
 });
 

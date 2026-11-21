@@ -27,7 +27,7 @@ export function clamp(value, min, max, fallback) {
   return boundedInt(value, min, max, fallback);
 }
 
-export function createRegistry({ manager, permission, allowSensitive = false, version = '0.2.0', logger = console }) {
+export function createRegistry({ manager, permission, allowSensitive = false, version = '0.3.0', logger = console }) {
   const tools = new Map();
   const ctx = {
     manager,

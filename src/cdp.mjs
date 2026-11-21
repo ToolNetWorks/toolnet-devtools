@@ -1,3 +1,5 @@
+import fsp from 'node:fs/promises';
+import path from 'node:path';
 import {
   estimateBytes,
   isAllowedEndpoint,
@@ -106,6 +108,18 @@ function safeJson(value, max = 8000) {
   catch { return redactText(String(value), max); }
 }
 
+function headerValue(headers, name) {
+  if (!headers || typeof headers !== 'object') return undefined;
+  const key = Object.keys(headers).find(item => item.toLowerCase() === name.toLowerCase());
+  return key == null ? undefined : headers[key];
+}
+
+function redirectLocation(headers, { includeSensitive = false } = {}) {
+  const raw = headerValue(headers, 'location');
+  if (raw == null) return undefined;
+  return includeSensitive ? String(raw) : redactUrl(String(raw));
+}
+
 export class ChromeSession {
   /**
    * One CDP connection to one page target. Event buffers are per instance, so
@@ -151,6 +165,7 @@ export class ChromeSession {
       lastNavigationAt: null
     };
     this.lastNetworkAt = Date.now();
+    this.lastWindowOpen = null;
     this.paused = null;
     this.debuggerEnabled = false;
     this.trace = null;
@@ -214,14 +229,23 @@ export class ChromeSession {
     return await this.requestText(`/json/activate/${encodeURIComponent(tabId)}`, { timeoutMs: 5000 });
   }
 
-  async attach(tabId, { fresh = true, enableDebugger = false } = {}) {
-    const targets = await this.tabs();
-    const tab = tabId ? targets.find(item => item.id === tabId) : targets[0];
+  async attach(tabId, { fresh = true, enableDebugger = false, target = null } = {}) {
+    let tab = target;
+    if (!tab) {
+      const targets = await this.tabs();
+      tab = tabId ? targets.find(item => item.id === tabId) : targets[0];
+    }
     if (!tab) throw new Error('Page tab not found. Call devtools_open_url or devtools_tabs first.');
+    if (!tab.webSocketDebuggerUrl) {
+      // /json/new may omit the debugger URL even though /json/list has it.
+      const targets = await this.tabs();
+      tab = targets.find(item => item.id === tab.id) ?? tab;
+    }
     if (!tab.webSocketDebuggerUrl || !isAllowedWebSocket(tab.webSocketDebuggerUrl, this.endpoint)) {
       throw new Error('Unsafe or missing Chrome WebSocket URL');
     }
     if (this.socket?.readyState === WebSocket.OPEN && this.tab?.id === tab.id && !fresh) {
+      await this.ensureCaptureEnabled();
       return this.status();
     }
     await this.close();
@@ -246,32 +270,48 @@ export class ChromeSession {
       this.pending.clear();
       this.socket = null;
     });
-    // Network and Runtime must be enabled before the first navigation. This is
-    // the core guarantee that the initial document/API requests are captured.
-    await this.send('Network.enable', { maxTotalBufferSize: 16_000_000, maxResourceBufferSize: 2_000_000 }, 10_000);
+    try {
+      // Network and Runtime must be enabled before the first navigation. This
+      // is the core guarantee that the initial document/API requests are
+      // captured from the first byte.
+      await this.enableCaptureDomains({ timeoutMs: 10_000 });
+    } catch (error) {
+      await this.close();
+      throw error;
+    }
+    if (enableDebugger) await this.enableDebugger();
+    return this.status();
+  }
+
+  async enableCaptureDomains({ timeoutMs = 10_000 } = {}) {
+    await this.send('Network.enable', {
+      maxTotalBufferSize: 16_000_000,
+      maxResourceBufferSize: 2_000_000,
+      maxPostDataSize: LIMITS.postDataChars
+    }, timeoutMs);
     this.captureReadiness.networkEnabled = true;
     this.captureReadiness.networkEnabledAt = new Date().toISOString();
-    await this.send('Runtime.enable', {}, 10_000);
+    await this.send('Runtime.enable', {}, timeoutMs);
     this.captureReadiness.runtimeEnabled = true;
     this.captureReadiness.runtimeEnabledAt = new Date().toISOString();
-    await this.send('Page.enable', {}, 10_000);
+    await this.send('Page.enable', {}, timeoutMs);
     this.captureReadiness.pageEnabled = true;
     this.captureReadiness.pageEnabledAt = new Date().toISOString();
     const optionalDomains = await Promise.allSettled([
-      this.send('Log.enable', {}, 8000),
-      this.send('Page.setLifecycleEventsEnabled', { enabled: true }, 8000),
-      this.send('DOM.enable', {}, 8000),
-      this.send('CSS.enable', {}, 8000)
+      this.send('Log.enable', {}, Math.min(8000, timeoutMs)),
+      this.send('Page.setLifecycleEventsEnabled', { enabled: true }, Math.min(8000, timeoutMs)),
+      this.send('DOM.enable', {}, Math.min(8000, timeoutMs)),
+      this.send('CSS.enable', {}, Math.min(8000, timeoutMs))
     ]);
     this.captureReadiness.enabledDomains = [
       'Network', 'Runtime', 'Page',
       ...(optionalDomains[0].status === 'fulfilled' ? ['Log'] : []),
+      ...(optionalDomains[1].status === 'fulfilled' ? ['Page.lifecycle'] : []),
       ...(optionalDomains[2].status === 'fulfilled' ? ['DOM'] : []),
       ...(optionalDomains[3].status === 'fulfilled' ? ['CSS'] : [])
     ];
     this.captureReadiness.readyAt = new Date().toISOString();
-    if (enableDebugger) await this.enableDebugger();
-    return this.status();
+    return { ...this.captureReadiness };
   }
 
   get connected() {
@@ -292,6 +332,7 @@ export class ChromeSession {
       scripts: this.scripts.size,
       debuggerEnabled: this.debuggerEnabled,
       paused: this.paused != null,
+      lastWindowOpen: this.lastWindowOpen,
       page: this.pageState,
       latestSequence: this.seq,
       buffers: {
@@ -362,6 +403,7 @@ export class ChromeSession {
     this.wsConnections.clear();
     this.scripts.clear();
     this.breakpoints.clear();
+    this.lastWindowOpen = null;
     this.paused = null;
     this.lastTrace = null;
     this.lastProfile = null;
@@ -598,6 +640,34 @@ export class ChromeSession {
       }
       return;
     }
+    if (method === 'Fetch.requestPaused') {
+      const rule = this._matchFetchRule(data);
+      if (!rule || rule.action === 'continue') {
+        this.send('Fetch.continueRequest', { requestId: data.requestId }).catch(() => {});
+        return;
+      }
+      if (rule.action === 'block') {
+        this.send('Fetch.failRequest', { requestId: data.requestId, errorReason: 'BlockedByClient' }).catch(() => {});
+        return;
+      }
+      if (rule.action === 'mock') {
+        const headers = Object.entries(rule.headers || { 'Content-Type': 'application/json' }).map(([name, value]) => ({ name, value: String(value) }));
+        const body = Buffer.from(rule.body ?? '').toString('base64');
+        this.send('Fetch.fulfillRequest', {
+          requestId: data.requestId,
+          responseCode: rule.status ?? 200,
+          responseHeaders: headers,
+          body
+        }).catch(() => this.send('Fetch.continueRequest', { requestId: data.requestId }).catch(() => {}));
+        return;
+      }
+      this.send('Fetch.continueRequest', { requestId: data.requestId }).catch(() => {});
+      return;
+    }
+    if (method === 'Fetch.authRequired') {
+      this.send('Fetch.continueWithAuth', { requestId: data.requestId, authChallengeResponse: { response: 'Default' } }).catch(() => {});
+      return;
+    }
     if (method === 'Page.javascriptDialogClosed') {
       const open = [...this.dialogs.items].reverse().find(item => !item.handled);
       if (open) {
@@ -605,6 +675,16 @@ export class ChromeSession {
         open.accepted = data.result;
         open.userInput = redactText(data.userInput, 1000);
       }
+      return;
+    }
+    if (method === 'Page.windowOpen') {
+      this.lastWindowOpen = {
+        url: redactUrl(data.url ?? ''),
+        windowName: data.windowName || null,
+        windowFeatures: data.windowFeatures ?? [],
+        userGesture: data.userGesture === true,
+        openedAt: new Date().toISOString()
+      };
       return;
     }
     if (method === 'Page.frameNavigated') {
@@ -717,19 +797,30 @@ export class ChromeSession {
       previous.finished = true;
       previous.status = data.redirectResponse?.status ?? previous.status;
       previous.statusText = data.redirectResponse?.statusText ?? previous.statusText;
-      previous.responseHeaders = redactHeaders(data.redirectResponse?.headers ?? previous.responseHeaders ?? {});
+      const redirectHeaders = redactHeaders(data.redirectResponse?.headers ?? previous.responseHeaders ?? {});
+      const location = redirectLocation(data.redirectResponse?.headers);
+      if (location && redirectHeaders) {
+        for (const key of Object.keys(redirectHeaders)) {
+          if (key.toLowerCase() === 'location') redirectHeaders[key] = location;
+        }
+      }
+      previous.responseHeaders = redirectHeaders;
       previous.redirectedTo = redactUrl(data.request?.url ?? '');
       previous.redirectResponse = {
         status: data.redirectResponse?.status,
         statusText: data.redirectResponse?.statusText,
         url: redactUrl(data.redirectResponse?.url ?? ''),
-        headers: redactHeaders(data.redirectResponse?.headers ?? {})
+        headers: redirectHeaders,
+        location
       };
+      if (this.options.allowSensitive) {
+        previous.redirectResponseLocationRaw = redirectLocation(data.redirectResponse?.headers, { includeSensitive: true });
+      }
       redirectChain = (previous.redirectChain ?? []).concat([{
         url: previous.url,
         status: previous.status,
         statusText: previous.statusText,
-        location: data.redirectResponse?.headers?.location ?? data.redirectResponse?.headers?.Location
+        location
       }]);
     }
     const request = data.request ?? {};
@@ -918,6 +1009,24 @@ export class ChromeSession {
     return false;
   }
 
+  async downloadViaClick(selector, { timeoutMs = 15000, settleMs = 1000, downloadPath } = {}) {
+    const dir = downloadPath || this.options.downloadDir || '/tmp/opencode/downloads';
+    await fsp.mkdir(dir, { recursive: true }).catch(() => {});
+    await this.send('Browser.setDownloadBehavior', { behavior: 'allowAndName', downloadPath: dir, eventsEnabled: true }, 8000).catch(() => {});
+    const before = new Set((await fsp.readdir(dir).catch(() => [])).filter(Boolean));
+    await this.click(selector, { timeoutMs, settleMs });
+    const deadline = Date.now() + Math.max(1000, settleMs + 5000);
+    let files = [];
+    while (Date.now() < deadline) {
+      const after = await fsp.readdir(dir).catch(() => []);
+      files = after.filter(f => !before.has(f));
+      if (files.some(f => !f.endsWith('.crdownload') && !f.endsWith('.tmp'))) break;
+      await sleep(250);
+    }
+    const completed = files.filter(f => !f.endsWith('.crdownload') && !f.endsWith('.tmp'));
+    return { triggered: true, selector, downloadPath: dir, files: completed, pending: files.filter(f => f.endsWith('.crdownload') || f.endsWith('.tmp')) };
+  }
+
   async waitForReadyState(target, timeoutMs) {
     const states = target === 'domcontentloaded' ? ['interactive', 'complete'] : ['complete'];
     return await this.waitFor(async () => {
@@ -960,22 +1069,44 @@ export class ChromeSession {
   async ensureCaptureEnabled({ timeoutMs = 10_000 } = {}) {
     if (!this.connected) throw new Error('Not attached to a Chrome tab. Attach CDP before enabling capture.');
     if (!this.captureReadiness.networkEnabled) {
-      await this.send('Network.enable', { maxTotalBufferSize: 16_000_000, maxResourceBufferSize: 2_000_000 }, timeoutMs);
+      await this.send('Network.enable', {
+        maxTotalBufferSize: 16_000_000,
+        maxResourceBufferSize: 2_000_000,
+        maxPostDataSize: LIMITS.postDataChars
+      }, timeoutMs);
       this.captureReadiness.networkEnabled = true;
-      this.captureReadiness.networkEnabledAt = this.captureReadiness.networkEnabledAt ?? new Date().toISOString();
+      this.captureReadiness.networkEnabledAt = new Date().toISOString();
     }
     if (!this.captureReadiness.runtimeEnabled) {
       await this.send('Runtime.enable', {}, timeoutMs);
       this.captureReadiness.runtimeEnabled = true;
-      this.captureReadiness.runtimeEnabledAt = this.captureReadiness.runtimeEnabledAt ?? new Date().toISOString();
+      this.captureReadiness.runtimeEnabledAt = new Date().toISOString();
     }
     if (!this.captureReadiness.pageEnabled) {
       await this.send('Page.enable', {}, timeoutMs);
       this.captureReadiness.pageEnabled = true;
-      this.captureReadiness.pageEnabledAt = this.captureReadiness.pageEnabledAt ?? new Date().toISOString();
+      this.captureReadiness.pageEnabledAt = new Date().toISOString();
     }
     const domains = new Set(this.captureReadiness.enabledDomains ?? []);
     for (const domain of ['Network', 'Runtime', 'Page']) domains.add(domain);
+    // Re-enable optional domains after a reconnect; they are cheap and keep
+    // DOM/CSS/Log available for the rest of the session.
+    const optional = [];
+    if (!domains.has('Log')) optional.push(['Log', 'Log.enable', {}]);
+    if (!domains.has('DOM')) optional.push(['DOM', 'DOM.enable', {}]);
+    if (!domains.has('CSS')) optional.push(['CSS', 'CSS.enable', {}]);
+    if (optional.length) {
+      const results = await Promise.allSettled(optional.map(([, method, params]) => this.send(method, params, Math.min(8000, timeoutMs))));
+      results.forEach((result, index) => {
+        if (result.status === 'fulfilled') domains.add(optional[index][0]);
+      });
+    }
+    if (!domains.has('Page.lifecycle')) {
+      try {
+        await this.send('Page.setLifecycleEventsEnabled', { enabled: true }, Math.min(8000, timeoutMs));
+        domains.add('Page.lifecycle');
+      } catch { /* optional */ }
+    }
     this.captureReadiness.enabledDomains = [...domains];
     this.captureReadiness.readyAt = this.captureReadiness.readyAt ?? new Date().toISOString();
     return { ...this.captureReadiness };
@@ -984,6 +1115,7 @@ export class ChromeSession {
   async navigate(url, { waitUntil = 'load', timeoutMs = 30_000 } = {}) {
     await this.ensureCaptureEnabled();
     const started = Date.now();
+    const requestCountBefore = this.requestLog.items.length;
     const navigationStartedAt = new Date().toISOString();
     this.captureReadiness.lastNavigationAt = navigationStartedAt;
     this.pageState = { url: redactUrl(url), title: '', readyState: 'loading', loaded: false, lastLoadAt: null };
@@ -991,7 +1123,19 @@ export class ChromeSession {
     const raw = await this.send('Page.navigate', { url }, 15_000);
     if (raw.errorText) throw new Error(`Navigation failed: ${raw.errorText}`);
     if (raw.isDownload) {
-      return { url: redactUrl(url), requestedUrl: redactUrl(url), isDownload: true, frameId: raw.frameId, loaderId: raw.loaderId, timedOut: false };
+      return {
+        url: redactUrl(url),
+        requestedUrl: redactUrl(url),
+        isDownload: true,
+        frameId: raw.frameId,
+        loaderId: raw.loaderId,
+        timedOut: false,
+        navigationStartedAt,
+        networkEnabledBeforeNavigation: this.captureReadiness.networkEnabled === true,
+        networkEnabledAt: this.captureReadiness.networkEnabledAt,
+        requestCountBefore,
+        requestCountAfter: this.requestLog.items.length
+      };
     }
     let timedOut = false;
     if (waitUntil !== 'none') {
@@ -1022,12 +1166,18 @@ export class ChromeSession {
       loaderId: raw.loaderId,
       navigationStartedAt,
       networkEnabledBeforeNavigation: this.captureReadiness.networkEnabled === true,
-      networkEnabledAt: this.captureReadiness.networkEnabledAt
+      networkEnabledAt: this.captureReadiness.networkEnabledAt,
+      requestCountBefore,
+      requestCountAfter: this.requestLog.items.length
     };
   }
 
   async reload({ ignoreCache = false, waitUntil = 'load', timeoutMs = 30_000 } = {}) {
+    await this.ensureCaptureEnabled();
     const started = Date.now();
+    const requestCountBefore = this.requestLog.items.length;
+    const navigationStartedAt = new Date().toISOString();
+    this.captureReadiness.lastNavigationAt = navigationStartedAt;
     this.pageState.loaded = false;
     await this.send('Page.reload', { ignoreCache }, 15_000);
     let timedOut = false;
@@ -1042,10 +1192,23 @@ export class ChromeSession {
     }
     const info = await this.pageInfo();
     if (this.tab) this.tab = { ...this.tab, url: info.url ?? this.tab.url, title: info.title ?? this.tab.title };
-    return { ...info, reloaded: true, timedOut, durationMs: Date.now() - started };
+    return {
+      ...info,
+      reloaded: true,
+      timedOut,
+      durationMs: Date.now() - started,
+      navigationStartedAt,
+      networkEnabledBeforeNavigation: this.captureReadiness.networkEnabled === true,
+      networkEnabledAt: this.captureReadiness.networkEnabledAt,
+      requestCountBefore,
+      requestCountAfter: this.requestLog.items.length
+    };
   }
 
   async history(direction, { waitUntil = 'load', timeoutMs = 30_000 } = {}) {
+    await this.ensureCaptureEnabled();
+    const requestCountBefore = this.requestLog.items.length;
+    const navigationStartedAt = new Date().toISOString();
     const history = await this.send('Page.getNavigationHistory');
     const entries = history.entries ?? [];
     const index = history.currentIndex ?? 0;
@@ -1059,45 +1222,86 @@ export class ChromeSession {
     if (waitUntil !== 'none') timedOut = !(await this.waitForReadyState('load', timeoutMs));
     const info = await this.pageInfo();
     if (this.tab) this.tab = { ...this.tab, url: info.url ?? this.tab.url, title: info.title ?? this.tab.title };
-    return { moved: true, direction, index: targetIndex, total: entries.length, ...info, timedOut };
+    return {
+      moved: true,
+      direction,
+      index: targetIndex,
+      total: entries.length,
+      ...info,
+      timedOut,
+      navigationStartedAt,
+      networkEnabledBeforeNavigation: this.captureReadiness.networkEnabled === true,
+      requestCountBefore,
+      requestCountAfter: this.requestLog.items.length
+    };
+  }
+
+  _locatorExpression(locator = {}) {
+    // Returns a JS expression that evaluates to an Element or null. Searches document, open shadow roots, and same-origin iframes.
+    const search = `((root) => {
+      const all = (r) => { const out=[]; const walk=(n)=>{ if(!n||n.nodeType!==1) return; out.push(n); if(n.shadowRoot) walk(n.shadowRoot); for(const c of (n.children||[])) walk(c); }; walk(r.body||r); return out; };
+      const nodes = all(root);
+      const vis = (el) => { try { const r=el.getBoundingClientRect(); const s=getComputedStyle(el); return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none'; } catch { return false; } };
+      return { nodes, vis };
+    })(document)`;
+    if (locator.selector) {
+      const sel = JSON.stringify(String(locator.selector));
+      return `(() => { const find=(root)=>{ try{const el=root.querySelector(${sel}); if(el) return el;}catch{} for(const n of root.querySelectorAll('*')){ if(n.shadowRoot){ const f=find(n.shadowRoot); if(f) return f; } } return null; }; return find(document); })()`;
+    }
+    if (locator.xpath) {
+      const xp = JSON.stringify(String(locator.xpath));
+      return `(() => { const find=(root,doc)=>{ try{ const r=doc.evaluate(${xp}, root, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue; if(r) return r; }catch{} for(const n of (root.querySelectorAll?root.querySelectorAll('*'):[])){ if(n.shadowRoot){ const f=find(n.shadowRoot, n.shadowRoot); if(f) return f; } } return null; }; return find(document, document); })()`;
+    }
+    if (locator.testId) {
+      const id = JSON.stringify(String(locator.testId));
+      return `(() => { const find=(root)=>{ const el=root.querySelector('[data-testid='+${id}+'],[data-test-id='+${id}+']'); if(el) return el; for(const n of root.querySelectorAll('*')){ if(n.shadowRoot){ const f=find(n.shadowRoot); if(f) return f; } } return null; }; return find(document); })()`;
+    }
+    if (locator.text) {
+      const t = JSON.stringify(String(locator.text).toLowerCase());
+      return `(() => { const find=(root)=>{ const nodes=[...root.querySelectorAll('a,button,input,textarea,select,label,[role],[aria-label],h1,h2,h3,h4,h5,h6,span,div,p,li,td,th')]; for(const el of nodes){ const txt=((el.innerText||el.textContent||el.value||'')+' '+(el.getAttribute('aria-label')||'')+' '+(el.getAttribute('title')||'')).toLowerCase(); if(txt.includes(${t})) return el; } for(const n of root.querySelectorAll('*')){ if(n.shadowRoot){ const f=find(n.shadowRoot); if(f) return f; } } return null; }; return find(document); })()`;
+    }
+    if (locator.role) {
+      const role = JSON.stringify(String(locator.role).toLowerCase());
+      const name = locator.name ? JSON.stringify(String(locator.name).toLowerCase()) : null;
+      return `(() => { const find=(root)=>{ const nodes=[...root.querySelectorAll('[role],button,a,input,select,textarea,h1,h2,h3,h4,h5,h6')]; for(const el of nodes){ const tag=el.tagName.toLowerCase(); const r=(el.getAttribute('role')||'').toLowerCase(); const implicit = (${role}==='button'&&(tag==='button'||el.type==='button'||el.type==='submit')) || (${role}==='link'&&tag==='a') || (${role}==='textbox'&&(tag==='textarea'||(tag==='input'&&!['button','submit','checkbox','radio','file','hidden'].includes(el.type))));
+        if(!(r===${role}||implicit)) continue; if(${name ? 'true' : 'false'}){ const n=((el.innerText||el.textContent||el.value||'')+' '+(el.getAttribute('aria-label')||'')).toLowerCase(); if(!n.includes(${name})) continue; } return el; } for(const n of root.querySelectorAll('*')){ if(n.shadowRoot){ const f=find(n.shadowRoot); if(f) return f; } } return null; }; return find(document); })()`;
+    }
+    throw new Error('Provide selector, xpath, text, role, or testId');
   }
 
   async waitForSelector(selector, timeoutMs = 10_000, { visible = false } = {}) {
+    const locator = typeof selector === 'string' ? { selector } : (selector || {});
+    const nodeExpr = this._locatorExpression(locator);
     const expr = visible
-      ? `(() => { const el = document.querySelector(${JSON.stringify(selector)}); if (!el) return false; const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; })()`
-      : `Boolean(document.querySelector(${JSON.stringify(selector)}))`;
+      ? `(() => { const el = ${nodeExpr}; if (!el) return false; const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; })()`
+      : `Boolean(${nodeExpr})`;
     return await this.waitFor(() => this.evaluateValue(expr, { timeoutMs: 3000 }), timeoutMs);
   }
 
-  async click(selector, { timeoutMs = 10_000, settleMs = 250 } = {}) {
-    if (typeof selector !== 'string' || !selector.trim()) throw new Error('selector is required');
-    const found = await this.waitForSelector(selector, timeoutMs, { visible: true });
-    if (!found) return { clicked: false, selector, reason: 'Element not found or not visible before timeout' };
-    await this.send('DOM.enable').catch(() => {});
-    const { root } = await this.send('DOM.getDocument', { depth: 1 });
-    const { nodeId } = await this.send('DOM.querySelector', { nodeId: root.nodeId, selector });
-    let point = null;
-    if (nodeId) {
-      await this.send('DOM.scrollIntoViewIfNeeded', { nodeId }).catch(() => {});
-      try {
-        const { model } = await this.send('DOM.getBoxModel', { nodeId });
-        const quad = model?.content;
-        if (quad && quad.length >= 8) {
-          point = { x: (quad[0] + quad[4]) / 2, y: (quad[1] + quad[5]) / 2 };
-        }
-      } catch { /* fallback to JS rect below */ }
-    }
-    if (!point) {
-      point = await this.evaluateValue(`(() => { const el = document.querySelector(${JSON.stringify(selector)}); if (!el) return null; el.scrollIntoView({ block: 'center', inline: 'center' }); const r = el.getBoundingClientRect(); return { x: r.left + r.width / 2, y: r.top + r.height / 2 }; })()`);
-    }
-    if (!point) return { clicked: false, selector, reason: 'Could not calculate a clickable position' };
-    const x = Math.max(0, Math.round(point.x));
-    const y = Math.max(0, Math.round(point.y));
+  async _resolveLocator(locatorInput, { timeoutMs = 10000, visible = true } = {}) {
+    const locator = typeof locatorInput === 'string' ? { selector: locatorInput } : (locatorInput || {});
+    const found = await this.waitForSelector(locator, timeoutMs, { visible });
+    if (!found) throw new Error(`Element not found${visible ? '/visible' : ''}: ${JSON.stringify(locator)}`);
+    const nodeExpr = this._locatorExpression(locator);
+    const rect = await this.evaluateValue(`(() => { const el = ${nodeExpr}; if (!el) return null; el.scrollIntoViewIfNeeded?.(); const r = el.getBoundingClientRect(); return { x:(r.left+r.right)/2, y:(r.top+r.bottom)/2, width:r.width, height:r.height, tag:el.tagName?.toLowerCase(), text:(el.innerText||el.textContent||'').trim().slice(0,200), value:el.value }; })()`, { timeoutMs: 5000 });
+    if (!rect) throw new Error(`Element resolved then disappeared: ${JSON.stringify(locator)}`);
+    return { locator, rect, nodeExpr };
+  }
+
+  async click(selector, { timeoutMs = 10_000, settleMs = 250, button = 'left', clickCount = 1 } = {}) {
+    const locator = typeof selector === 'string' ? { selector } : selector;
+    await this.ensureCaptureEnabled();
+    this.lastWindowOpen = null;
+    const { rect } = await this._resolveLocator(locator, { timeoutMs, visible: true });
+    const x = Math.max(0, Math.round(rect.x));
+    const y = Math.max(0, Math.round(rect.y));
     await this.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y });
-    await this.send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 });
-    await this.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 });
+    for (let i = 1; i <= Math.max(1, clickCount); i++) {
+      await this.send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button, clickCount: i });
+      await this.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button, clickCount: i });
+    }
     if (settleMs > 0) await sleep(settleMs);
-    return { clicked: true, selector, x, y, ...(await this.pageInfo()) };
+    return { clicked: true, locator, selector: typeof selector === 'string' ? selector : undefined, x, y, ...(await this.pageInfo()), openedWindow: this.lastWindowOpen };
   }
 
   async dispatchKey(key, { modifiers = 0, code = null, keyCode = null, text = undefined } = {}) {
@@ -1140,6 +1344,7 @@ export class ChromeSession {
   async typeText(selector, text, { clear = true, submit = false, timeoutMs = 10_000, settleMs = 150 } = {}) {
     if (typeof text !== 'string') throw new Error('text must be a string');
     if (text.length > 20_000) throw new Error('text is too long (maximum 20000 characters)');
+    await this.ensureCaptureEnabled();
     if (selector) {
       const found = await this.waitForSelector(selector, timeoutMs, { visible: true });
       if (!found) return { typed: false, selector, reason: 'Element not found or not visible before timeout' };
@@ -1160,6 +1365,7 @@ export class ChromeSession {
   }
 
   async scroll({ x = null, y = null, deltaX = 0, deltaY = 600, selector = null, settleMs = 200 } = {}) {
+    await this.ensureCaptureEnabled();
     if (selector) {
       await this.evaluateValue(`(() => { const el = document.querySelector(${JSON.stringify(selector)}); if (!el) return false; el.scrollIntoView({ block: 'center' }); return true; })()`);
     }
@@ -1250,6 +1456,41 @@ export class ChromeSession {
     const name = type === 'session' ? 'sessionStorage' : 'localStorage';
     await this.evaluateValue(`(() => { window[${JSON.stringify(name)}].clear(); return true; })()`);
     return { cleared: true, type };
+  }
+
+  async storageState({ includeSensitive = false } = {}) {
+    const url = this.pageState?.url || 'about:blank';
+    let cookies = [];
+    try {
+      if (/^https?:/i.test(url)) cookies = await this.cookies([url]);
+      else cookies = await this.cookies();
+    } catch { /* ignore */ }
+    const local = await this.storage('local', 1000).catch(() => ({ entries: [] }));
+    const session = await this.storage('session', 1000).catch(() => ({ entries: [] }));
+    const redact = (value) => includeSensitive ? value : (value == null ? value : '[REDACTED]');
+    return {
+      url,
+      origin: (() => { try { return new URL(url).origin; } catch { return null; } })(),
+      cookies: cookies.map(c => ({ ...c, value: redact(c.value) })),
+      localStorage: (local.entries ?? []).map(e => ({ ...e, value: redact(e.value) })),
+      sessionStorage: (session.entries ?? []).map(e => ({ ...e, value: redact(e.value) }))
+    };
+  }
+
+  async restoreStorageState(state, { includeSensitive = false } = {}) {
+    if (!state || typeof state !== 'object') throw new Error('state must be an object');
+    if (!includeSensitive) throw new Error('Restoring storage state requires includeSensitive=true and full-debug+DEVTOOLS_ALLOW_SENSITIVE');
+    const results = { cookies: 0, localStorage: 0, sessionStorage: 0, errors: [] };
+    for (const cookie of state.cookies ?? []) {
+      try { await this.setCookie(cookie); results.cookies++; } catch (e) { results.errors.push(`cookie:${cookie?.name}:${String(e?.message ?? e)}`); }
+    }
+    for (const entry of state.localStorage ?? []) {
+      try { await this.setStorageItem('local', entry.key, entry.value ?? ''); results.localStorage++; } catch (e) { results.errors.push(`local:${entry?.key}:${String(e?.message ?? e)}`); }
+    }
+    for (const entry of state.sessionStorage ?? []) {
+      try { await this.setStorageItem('session', entry.key, entry.value ?? ''); results.sessionStorage++; } catch (e) { results.errors.push(`session:${entry?.key}:${String(e?.message ?? e)}`); }
+    }
+    return results;
   }
 
   async performanceMetrics() {
@@ -1475,6 +1716,274 @@ export class ChromeSession {
       summary: this.lastProfileSummary,
       topFunctions: top
     };
+  }
+
+  async setViewport({ width, height, deviceScaleFactor = 1, mobile = false, hasTouch = false, isLandscape = true } = {}) {
+    if (!Number.isInteger(width) || !Number.isInteger(height)) throw new Error('width and height must be integers');
+    await this.send('Emulation.setDeviceMetricsOverride', {
+      width: Math.max(1, Math.min(10000, width)),
+      height: Math.max(1, Math.min(10000, height)),
+      deviceScaleFactor: Math.max(0.1, Math.min(10, Number(deviceScaleFactor) || 1)),
+      mobile: Boolean(mobile),
+      screenWidth: Math.max(1, Math.min(10000, width)),
+      screenHeight: Math.max(1, Math.min(10000, height))
+    }, 10000);
+    await this.send('Emulation.setTouchEmulationEnabled', { enabled: Boolean(hasTouch || mobile), maxTouchPoints: (hasTouch || mobile) ? 5 : 0 }, 8000).catch(() => {});
+    return { set: true, width, height, deviceScaleFactor, mobile, hasTouch, isLandscape };
+  }
+
+  async clearViewport() {
+    await this.send('Emulation.clearDeviceMetricsOverride', {}, 8000).catch(() => {});
+    await this.send('Emulation.setTouchEmulationEnabled', { enabled: false }, 8000).catch(() => {});
+    return { cleared: true };
+  }
+
+  async setUserAgent(userAgent, { acceptLanguage, platform } = {}) {
+    if (typeof userAgent !== 'string' || !userAgent.trim()) throw new Error('userAgent is required');
+    const params = { userAgent: userAgent.slice(0, 2000) };
+    if (acceptLanguage) params.acceptLanguage = String(acceptLanguage).slice(0, 200);
+    if (platform) params.platform = String(platform).slice(0, 200);
+    await this.send('Network.setUserAgentOverride', params, 8000);
+    return { set: true, userAgent: params.userAgent, acceptLanguage: params.acceptLanguage, platform: params.platform };
+  }
+
+  async setGeolocation({ latitude, longitude, accuracy = 1 } = {}) {
+    await this.send('Emulation.setGeolocationOverride', {
+      latitude: Number(latitude),
+      longitude: Number(longitude),
+      accuracy: Math.max(0, Number(accuracy) || 1)
+    }, 8000);
+    return { set: true, latitude: Number(latitude), longitude: Number(longitude), accuracy: Math.max(0, Number(accuracy) || 1) };
+  }
+
+  async clearGeolocation() {
+    await this.send('Emulation.clearGeolocationOverride', {}, 8000).catch(() => {});
+    return { cleared: true };
+  }
+
+  async setTimezone(timezoneId) {
+    await this.send('Emulation.setTimezoneOverride', { timezoneId: String(timezoneId) }, 8000);
+    return { set: true, timezoneId: String(timezoneId) };
+  }
+
+  async setLocale(locale) {
+    await this.send('Emulation.setLocaleOverride', { locale: String(locale) }, 8000).catch(() => {});
+    return { set: true, locale: String(locale) };
+  }
+
+  async emulateMedia({ media, colorScheme, reducedMotion, forcedColors } = {}) {
+    const features = [];
+    if (colorScheme) features.push({ name: 'prefers-color-scheme', value: String(colorScheme) });
+    if (reducedMotion) features.push({ name: 'prefers-reduced-motion', value: String(reducedMotion) });
+    if (forcedColors) features.push({ name: 'forced-colors', value: String(forcedColors) });
+    await this.send('Emulation.setEmulatedMedia', {
+      media: media ? String(media) : '',
+      features
+    }, 8000);
+    return { set: true, media: media || null, features };
+  }
+
+  async emulateNetwork({ offline = false, latency = 0, downloadThroughput = -1, uploadThroughput = -1, connectionType = 'none' } = {}) {
+    await this.send('Network.emulateNetworkConditions', {
+      offline: Boolean(offline),
+      latency: Math.max(0, Number(latency) || 0),
+      downloadThroughput: Number(downloadThroughput),
+      uploadThroughput: Number(uploadThroughput),
+      connectionType: String(connectionType || 'none')
+    }, 8000);
+    return { set: true, offline: Boolean(offline), latency: Math.max(0, Number(latency) || 0), downloadThroughput: Number(downloadThroughput), uploadThroughput: Number(uploadThroughput), connectionType };
+  }
+
+  async setCacheDisabled(cacheDisabled = true) {
+    await this.send('Network.setCacheDisabled', { cacheDisabled: Boolean(cacheDisabled) }, 8000);
+    return { cacheDisabled: Boolean(cacheDisabled) };
+  }
+
+  async setExtraHTTPHeaders(headers = {}) {
+    if (headers == null || typeof headers !== 'object' || Array.isArray(headers)) throw new Error('headers must be an object');
+    const safe = {};
+    for (const [k, v] of Object.entries(headers).slice(0, 50)) safe[String(k)] = String(v);
+    await this.send('Network.setExtraHTTPHeaders', { headers: safe }, 8000);
+    return { set: true, headers: redactHeaders(safe), count: Object.keys(safe).length };
+  }
+
+  async setBlockedURLs(urls = []) {
+    if (!Array.isArray(urls)) throw new Error('urls must be an array');
+    const clean = urls.slice(0, 200).map(u => String(u));
+    await this.send('Network.setBlockedURLs', { urls: clean }, 8000);
+    return { set: true, urls: clean };
+  }
+
+  async enableFetchInterception({ patterns = ['*'], handleAuth = false } = {}) {
+    this.fetchInterception = this.fetchInterception || { enabled: false, rules: [], handleAuth: Boolean(handleAuth) };
+    this.fetchInterception.enabled = true;
+    this.fetchInterception.handleAuth = Boolean(handleAuth);
+    await this.send('Fetch.enable', {
+      patterns: (Array.isArray(patterns) ? patterns : [patterns]).map(p => (typeof p === 'string' ? { urlPattern: p, requestStage: 'Request' } : p)),
+      handleAuthRequests: Boolean(handleAuth)
+    }, 10000);
+    return { enabled: true, patterns, handleAuth: Boolean(handleAuth), rules: this.fetchInterception.rules.length };
+  }
+
+  async disableFetchInterception() {
+    this.fetchInterception = { enabled: false, rules: [], handleAuth: false };
+    await this.send('Fetch.disable', {}, 8000).catch(() => {});
+    return { enabled: false };
+  }
+
+  addFetchRule(rule) {
+    this.fetchInterception = this.fetchInterception || { enabled: false, rules: [], handleAuth: false };
+    const normalized = {
+      id: `rule-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      urlPattern: rule.urlPattern ? String(rule.urlPattern) : '*',
+      method: rule.method ? String(rule.method).toUpperCase() : null,
+      action: rule.action || 'continue', // continue|block|mock
+      status: Number.isInteger(rule.status) ? rule.status : 200,
+      headers: rule.headers && typeof rule.headers === 'object' ? rule.headers : null,
+      body: rule.body != null ? String(rule.body) : null,
+      once: rule.once === true
+    };
+    this.fetchInterception.rules.push(normalized);
+    return normalized;
+  }
+
+  clearFetchRules() {
+    this.fetchInterception = this.fetchInterception || { enabled: false, rules: [], handleAuth: false };
+    this.fetchInterception.rules = [];
+    return { cleared: true };
+  }
+
+  listFetchRules() {
+    this.fetchInterception = this.fetchInterception || { enabled: false, rules: [], handleAuth: false };
+    return { enabled: this.fetchInterception.enabled, rules: this.fetchInterception.rules };
+  }
+
+  _matchFetchRule(event) {
+    const rules = this.fetchInterception?.rules ?? [];
+    const url = event.request?.url || '';
+    const method = event.request?.method || '';
+    for (let i = 0; i < rules.length; i++) {
+      const r = rules[i];
+      if (r.method && r.method !== method) continue;
+      const pattern = r.urlPattern === '*' ? '' : r.urlPattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\\\*/g, '.*');
+      if (!pattern || new RegExp(pattern).test(url)) {
+        if (r.once) rules.splice(i, 1);
+        return r;
+      }
+    }
+    return null;
+  }
+
+  async clearBrowserCache() {
+    await this.send('Network.clearBrowserCache', {}, 10000);
+    return { cleared: true };
+  }
+
+  async accessibilitySnapshot({ interestingOnly = true, root = null } = {}) {
+    await this.send('Accessibility.enable', {}, 8000).catch(() => {});
+    const params = { interestingOnly: Boolean(interestingOnly) };
+    const raw = await this.send('Accessibility.getFullAXTree', params, 20000).catch(async () => {
+      // fallback to partial snapshot
+      return await this.send('Accessibility.getPartialAXTree', { interestingOnly: Boolean(interestingOnly) }, 20000);
+    });
+    const nodes = (raw.nodes ?? []).slice(0, 2000).map(node => ({
+      nodeId: node.nodeId,
+      role: node.role?.value,
+      name: node.name?.value,
+      value: node.value?.value,
+      description: node.description?.value,
+      ignored: node.ignored,
+      childIds: node.childIds?.slice(0, 50),
+      backendDOMNodeId: node.backendDOMNodeId
+    }));
+    return { total: raw.nodes?.length ?? 0, nodes, interestingOnly: Boolean(interestingOnly) };
+  }
+
+  async printToPDF({ landscape = false, printBackground = true, scale = 1, paperWidth, paperHeight } = {}) {
+    const params = {
+      landscape: Boolean(landscape),
+      printBackground: Boolean(printBackground),
+      scale: Math.max(0.1, Math.min(2, Number(scale) || 1))
+    };
+    if (Number.isFinite(paperWidth)) params.paperWidth = paperWidth;
+    if (Number.isFinite(paperHeight)) params.paperHeight = paperHeight;
+    const raw = await this.send('Page.printToPDF', params, 30000);
+    return { data: raw.data, bytes: Buffer.from(raw.data, 'base64').length };
+  }
+
+  async uploadFile(selector, files) {
+    if (!selector || typeof selector !== 'string') throw new Error('selector is required');
+    const paths = Array.isArray(files) ? files : [files];
+    if (!paths.length) throw new Error('files is required');
+    const { root } = await this.send('DOM.getDocument', { depth: 0 }, 8000);
+    const node = await this.send('DOM.querySelector', { nodeId: root.nodeId, selector }, 8000);
+    if (!node?.nodeId) throw new Error(`Selector not found: ${selector}`);
+    await this.send('DOM.setFileInputFiles', {
+      files: paths.map(f => String(f)),
+      nodeId: node.nodeId
+    }, 10000);
+    return { uploaded: true, selector, files: paths.map(f => String(f)), count: paths.length };
+  }
+
+  async hover(selector, { timeoutMs = 10000 } = {}) {
+    await this.ensureCaptureEnabled();
+    const { rect, locator } = await this._resolveLocator(selector, { timeoutMs, visible: true });
+    const x = Math.round(rect.x), y = Math.round(rect.y);
+    await this.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y }, 5000);
+    return { hovered: true, locator, selector: typeof selector === 'string' ? selector : undefined, x, y, ...(await this.pageInfo()) };
+  }
+
+  async dblclick(selector, { timeoutMs = 10000, settleMs = 250 } = {}) {
+    return await this.click(selector, { timeoutMs, settleMs, clickCount: 2 });
+  }
+
+  async focus(selector, { timeoutMs = 10000 } = {}) {
+    await this.ensureCaptureEnabled();
+    const { nodeExpr, locator } = await this._resolveLocator(selector, { timeoutMs, visible: false });
+    await this.evaluateValue(`(() => { const el = ${nodeExpr}; el?.focus?.(); return true; })()`, { timeoutMs: 5000 });
+    return { focused: true, locator, selector: typeof selector === 'string' ? selector : undefined, ...(await this.pageInfo()) };
+  }
+
+  async dragAndDrop(source, target, { timeoutMs = 10000, steps = 12 } = {}) {
+    await this.ensureCaptureEnabled();
+    const src = await this._resolveLocator(source, { timeoutMs, visible: true });
+    const dst = await this._resolveLocator(target, { timeoutMs, visible: true });
+    const sx = Math.round(src.rect.x), sy = Math.round(src.rect.y);
+    const tx = Math.round(dst.rect.x), ty = Math.round(dst.rect.y);
+    await this.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: sx, y: sy });
+    await this.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: sx, y: sy, button: 'left', clickCount: 1 });
+    for (let i = 1; i <= steps; i++) {
+      const x = Math.round(sx + (tx - sx) * i / steps);
+      const y = Math.round(sy + (ty - sy) * i / steps);
+      await this.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'left' });
+      await sleep(16);
+    }
+    await this.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: tx, y: ty, button: 'left', clickCount: 1 });
+    return { dragged: true, source: src.locator, target: dst.locator, from: { x: sx, y: sy }, to: { x: tx, y: ty }, ...(await this.pageInfo()) };
+  }
+
+  async selectOption(selector, values = []) {
+    await this.ensureCaptureEnabled();
+    const vals = Array.isArray(values) ? values : [values];
+    const expression = `(() => {
+      const el = document.querySelector(${JSON.stringify(selector)});
+      if (!el) return { found: false };
+      const wanted = new Set(${JSON.stringify(vals.map(String))});
+      let matched = [];
+      for (const opt of el.options ?? []) {
+        const should = wanted.has(opt.value) || wanted.has(opt.text) || wanted.has(opt.label);
+        if (el.multiple) opt.selected = should;
+        else if (should && matched.length === 0) opt.selected = true;
+        else if (!el.multiple) opt.selected = false;
+        if (opt.selected) matched.push({ value: opt.value, text: opt.text, label: opt.label });
+      }
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      return { found: true, matched, value: el.value, selectedIndex: el.selectedIndex };
+    })()`;
+    const result = await this.evaluateValue(expression);
+    if (!result.found) throw new Error(`Selector not found: ${selector}`);
+    return { selected: true, selector, ...result };
   }
 
   async close() {
