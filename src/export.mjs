@@ -2,7 +2,7 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { redactHeaders, redactText, redactUrl, safeResponseBody } from './security.mjs';
 
-const HAR_CREATOR = { name: 'toolnet-devtools-mcp', version: '0.3.0' };
+const HAR_CREATOR = { name: 'toolnet-devtools-mcp', version: '0.4.0' };
 const MAX_EXPORT_BYTES = 64_000_000;
 
 function round(value, digits = 2) {

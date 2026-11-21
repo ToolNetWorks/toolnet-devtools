@@ -1,3 +1,7 @@
+import { registerReverseTools } from './reverse.mjs';
+import { registerProbeTools } from './probe.mjs';
+import { registerSecurityProbeTools } from './security-probe.mjs';
+import { registerDeepProbeTools } from './deep-probe.mjs';
 import { registerActionTools } from './actions.mjs';
 import { registerAdvancedTools } from './advanced.mjs';
 import { registerObserveTools } from './observe.mjs';
@@ -10,5 +14,9 @@ export function registerTools(registry) {
   registerSessionTools(registry);
   registerObserveTools(registry);
   registerAdvancedTools(registry);
+  registerReverseTools(registry);
+  registerProbeTools(registry);
+  registerSecurityProbeTools(registry);
+  registerDeepProbeTools(registry);
   return registry;
 }

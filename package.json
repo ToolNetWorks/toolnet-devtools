@@ -1,16 +1,43 @@
 {
   "name": "toolnet-devtools-mcp",
-  "version": "0.3.0",
-  "private": true,
+  "version": "0.4.0",
+  "private": false,
   "description": "Dependency-free universal Chrome DevTools MCP server for AI agents",
   "type": "module",
-  "bin": { "toolnet-devtools": "./src/index.mjs" },
+  "bin": {
+    "toolnet-devtools": "./src/index.mjs"
+  },
   "scripts": {
     "start": "node src/index.mjs",
-    "test": "node --test test/core.test.mjs test/features.test.mjs",
+    "test": "node --test test/core.test.mjs test/features.test.mjs test/reverse.test.mjs test/probe.test.mjs test/security-probe.test.mjs test/deep-probe.test.mjs",
     "test:integration": "DEVTOOLS_PERMISSION=full-debug DEVTOOLS_ALLOW_SENSITIVE=1 node --test test/integration.test.mjs",
     "test:all": "npm test && npm run test:integration"
   },
-  "engines": { "node": ">=22" },
-  "license": "MIT"
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "MIT",
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "examples"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ToolNetWorks/toolnet-devtools.git"
+  },
+  "homepage": "https://github.com/ToolNetWorks/toolnet-devtools#readme",
+  "bugs": {
+    "url": "https://github.com/ToolNetWorks/toolnet-devtools/issues"
+  },
+  "keywords": [
+    "mcp",
+    "devtools",
+    "chrome",
+    "cdp",
+    "automation",
+    "debugging",
+    "ai-agent"
+  ]
 }

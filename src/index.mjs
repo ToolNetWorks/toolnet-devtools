@@ -5,7 +5,7 @@ import { normalizePermission } from './security.mjs';
 import { registerTools } from './tools/index.mjs';
 import { createRegistry } from './tools/registry.mjs';
 
-const VERSION = '0.3.0';
+const VERSION = '0.4.0';
 
 function main() {
   let permission;

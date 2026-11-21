@@ -176,6 +176,102 @@ export async function createFixtureServer() {
       send(200, data, 'image/png');
       return;
     }
+    if (url.pathname === '/graphql') {
+      let body = '';
+      req.on('data', chunk => { body += chunk; });
+      req.on('end', () => {
+        if (body.includes('__schema')) {
+          send(200, JSON.stringify({ data: { __schema: {
+            queryType: { name: 'Query' },
+            mutationType: { name: 'Mutation' },
+            subscriptionType: null,
+            types: [
+              { name: 'User', kind: 'OBJECT', fields: [{ name: 'id' }, { name: 'email' }] },
+              { name: 'Post', kind: 'OBJECT', fields: [{ name: 'id' }, { name: 'title' }] },
+              { name: '__Type', kind: 'OBJECT', fields: [] }
+            ]
+          } } }), 'application/json');
+          return;
+        }
+        send(200, JSON.stringify({ data: { user: { id: 'u1', email: 'user@fixture.test' } } }), 'application/json');
+      });
+      return;
+    }
+    if (url.pathname === '/graph.html') {
+      send(200, `<!doctype html><html><head><title>Fixture GraphQL</title></head><body>
+        <h1>GraphQL fixture</h1><div id="result">waiting</div>
+        <script>
+          fetch('/graphql', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ operationName: 'GetUser', query: 'query GetUser { user { id email } }' }) })
+            .then(r => r.json()).then(data => { document.querySelector('#result').textContent = 'user:' + data.data.user.id; })
+            .catch(error => console.error('graphql-failed', String(error)));
+        </script>
+      </body></html>`);
+      return;
+    }
+    if (url.pathname === '/app.js') {
+      send(200, `function fixtureApp() { return 'app'; }\nconsole.log('app-loaded');\n//# sourceMappingURL=app.js.map\n`, 'application/javascript');
+      return;
+    }
+    if (url.pathname === '/app.js.map') {
+      send(200, JSON.stringify({
+        version: 3,
+        file: 'app.js',
+        sources: ['webpack://fixture/src/a.js', 'webpack://fixture/src/b.js'],
+        sourcesContent: ['export const a = 1;', 'export const b = 2;']
+      }), 'application/json');
+      return;
+    }
+    if (url.pathname === '/map.html') {
+      send(200, `<!doctype html><html><head><title>Fixture Source Map</title></head><body>
+        <h1>Source map fixture</h1><script src="/app.js"></script>
+      </body></html>`);
+      return;
+    }
+    if (url.pathname === '/third-party.js') {
+      send(200, `console.log('third-party-loaded');\n`, 'application/javascript');
+      return;
+    }
+    if (url.pathname === '/login-form.html') {
+      const hostPort = new URL('http://' + (req.headers.host ?? '127.0.0.1:80')).port || '80';
+      send(200, `<!doctype html><html><head><title>Fixture Login</title></head><body>
+        <h1>Login fixture</h1>
+        <form method="GET" action="/login">
+          <input type="text" name="user" value="">
+          <input type="password" name="password" value="">
+          <button type="submit">Sign in</button>
+        </form>
+        <a id="out-link" href="/out?redirect=https://example.test/away">Go out</a>
+        <script src="http://localhost:${hostPort}/third-party.js"></script>
+        <script>
+          localStorage.setItem('access_token', 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmaXh0dXJlIn0.abcdef123456');
+          sessionStorage.setItem('session_id', 'fixture-session-1');
+          fetch('/api/data?token=url-token-9').then(r => r.json()).catch(() => {});
+        </script>
+      </body></html>`);
+      return;
+    }
+    if (url.pathname === '/login' || url.pathname === '/out') {
+      send(200, '<!doctype html><title>Fixture landing</title><h1>Landed</h1>');
+      return;
+    }
+    if (url.pathname === '/chat.html') {
+      send(200, `<!doctype html><html><head><title>Fixture Chat</title></head><body>
+        <h1>Chat fixture</h1>
+        <input id="chat-input" type="text" placeholder="message">
+        <button id="send" type="button">Send</button>
+        <div id="response"></div>
+        <script>
+          const respond = () => {
+            const text = document.querySelector('#chat-input').value;
+            if (!text) return;
+            setTimeout(() => { document.querySelector('#response').textContent = 'Opposite Day accepted: false'; }, 60);
+          };
+          document.querySelector('#send').addEventListener('click', respond);
+          document.querySelector('#chat-input').addEventListener('keydown', event => { if (event.key === 'Enter') respond(); });
+        </script>
+      </body></html>`);
+      return;
+    }
     if (url.pathname === '/favicon.ico') { send(204, ''); return; }
     send(404, '<!doctype html><title>Not found</title><h1>404</h1>');
   });

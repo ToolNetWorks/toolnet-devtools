@@ -7,7 +7,7 @@ function protocolVersion(requested) {
   return ACCEPTED_PROTOCOLS.includes(requested) ? requested : ACCEPTED_PROTOCOLS[1];
 }
 
-export function runStdioServer({ registry, manager, version = '0.3.0', logger = console }) {
+export function runStdioServer({ registry, manager, version = '0.4.0', logger = console }) {
   const maxResponse = (() => {
     const raw = Number(process.env.DEVTOOLS_MAX_RESPONSE_CHARS);
     return Number.isInteger(raw) ? Math.max(10_000, Math.min(500_000, raw)) : 60_000;

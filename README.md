@@ -1,4 +1,4 @@
-# ToolNet DevTools MCP v0.3.0
+# ToolNet DevTools MCP v0.4.0
 
 A dependency-free **universal Chrome DevTools MCP server** for AI coding agents. It drives any `http://` or `https://` site through the **Chrome DevTools Protocol (CDP)** and exposes Console, Network, WebSocket, DOM/CSS, Debugger, Performance, Storage and export workflows as MCP tools.
 
@@ -14,7 +14,7 @@ No Playwright, Puppeteer, Selenium, browser download, database or `npm install` 
 - **No manual tab setup** - create, select, close, reload, navigate back/forward, click, type, press keys and scroll through tools.
 - **Safe defaults** - three permission tiers, loopback-only CDP endpoints, secret redaction and bounded buffers.
 - **Durable artifacts** - JSON, HAR 1.2, error report, trace and `.cpuprofile` exports inside a confined export directory.
-- **51 MCP tools** including `devtools_f12_check`, emulation/network control, interception/mock, accessibility/PDF/snapshot, storage-state, download/upload, drag/drop, and locator-based input actions, JSON-RPC stdio transport, works with Codex CLI, OpenCode and other MCP clients.
+- **57 MCP tools** including `devtools_f12_check`, emulation/network control, interception/mock, accessibility/PDF/snapshot, storage-state, download/upload, drag/drop, locator-based input actions, reverse-engineering, LLM chat probing, security probing, GraphQL/source-map/request-replay deep analysis, JSON-RPC stdio transport, works with Codex CLI, OpenCode and other MCP clients.
 
 ## Requirements
 
@@ -152,7 +152,7 @@ Additional behavior:
 - Redaction is best-effort pattern matching, not a guarantee. Do not point this server at production accounts or sensitive data unless you accept that risk.
 - Keep the CDP port bound to loopback. `CDP_ALLOW_REMOTE=1` is available but strongly discouraged.
 
-## MCP tools (51)
+## MCP tools (57)
 
 Tools without a tier note are `read-only`. The current tier is shown in `devtools_status`.
 
@@ -226,6 +226,12 @@ Tools without a tier note are `read-only`. The current tier is shown in `devtool
 | `devtools_storage_state` | interactive | Export/restore cookies + local/session storage (restore requires sensitive gate). |
 | `devtools_capture` | interactive | Mark a capture window, then stop and summarize its requests/errors. |
 | `devtools_export` | | Write JSON, HAR 1.2, error report, trace or CPU profile. |
+| `devtools_reverse_engineer` | | Client-observable reverse-engineering report: API patterns, JSON shapes, origins/assets, DOM inventory and script heuristics (navigation needs interactive; script source needs full-debug). |
+| `devtools_llm_probe` | interactive | Garak-style jailbreak probe suite for authorized LLM chat UIs: Opposite Day, Boolean Opposite Machine (BOM), AntiGPT opposite persona, and reversed-string (FlipAttack-style) prompts; detects inverted boolean answers. |
+| `devtools_security_probe` | | Authorized security probing: passive credential-exposure scan (URL tokens, secret-looking storage, JWTs — values stay redacted), paywall/auth-gate bypass detection, and attack-surface mapping (mixed content, credential-form risks, open-redirect params, sensitive paths, third-party scripts, dangerous inline JS). Navigation needs interactive. |
+| `devtools_graphql` | | Discover GraphQL endpoints/operations from captured traffic; bounded introspection query from the page context (interactive). |
+| `devtools_sourcemap` | full-debug | List scripts with source maps and fetch bounded .map metadata (sources inventory, sourcesContent coverage). |
+| `devtools_replay` | interactive | Re-send a captured or explicit request from the page context with method/header/JSON overrides (Burp Repeater-lite, authorized targets). |
 
 ## Recommended workflows
 

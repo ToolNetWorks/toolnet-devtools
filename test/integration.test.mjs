@@ -441,7 +441,7 @@ test('real Chromium 127.0.0.1:9222 end-to-end F12 workflow', { timeout: 180_000 
       assert.equal(status.activeSession.connected, true);
       assert.ok(status.activeSession.captureReadiness.networkEnabled, true);
       assert.ok(status.browser.browser.length > 0);
-      assert.equal(status.serverVersion, '0.3.0');
+      assert.equal(status.serverVersion, '0.4.0');
     });
   } finally {
     for (const tabId of opened) await closeTab(tabId);
@@ -515,6 +515,116 @@ test('interactive permission runs the complete F12 workflow without full-debug',
     assert.match(cdpDenied.content[0].text, /full-debug/);
   } finally {
     if (tab) await client.call('devtools_close_tab', { tabId: tab }).catch(() => {});
+    await client.close();
+    await fixture.close();
+  }
+});
+
+test('deep-probe, security, reverse and LLM probe tools work against real Chromium', { timeout: 180_000 }, async t => {
+  if (!chromeReady) {
+    t.skip(`Chrome is not reachable at ${MAIN_ENDPOINT}`);
+    return;
+  }
+  const fixture = await createFixtureServer();
+  const client = new McpClient({
+    env: {
+      CDP_ENDPOINT: MAIN_ENDPOINT,
+      DEVTOOLS_PERMISSION: 'full-debug',
+      DEVTOOLS_ALLOW_SENSITIVE: '1',
+      DEVTOOLS_AUTO_LAUNCH: '0'
+    }
+  });
+  const opened = new Set();
+  try {
+    await client.initialize();
+
+    async function open(url, options = {}) {
+      const result = await client.call('devtools_open_url', {
+        url, waitUntil: 'load', settleMs: 400, networkIdleWaitMs: 500, ...options
+      });
+      opened.add(result.sessionId);
+      return result;
+    }
+
+    await t.test('devtools_graphql discovers the endpoint and introspects the schema', async () => {
+      await open(fixture.origin + '/graph.html', { waitUntil: 'networkidle2', settleMs: 500 });
+      const endpoints = await client.call('devtools_graphql', { action: 'endpoints' });
+      assert.ok(endpoints.endpoints.some(e => e.endpoint.endsWith('/graphql')), JSON.stringify(endpoints.endpoints));
+      const found = endpoints.endpoints.find(e => e.endpoint.endsWith('/graphql'));
+      assert.ok(found.operations.includes('GetUser'));
+      const introspected = await client.call('devtools_graphql', { action: 'introspect' });
+      assert.equal(introspected.introspectionAvailable, true);
+      assert.equal(introspected.schema.queryType, 'Query');
+      assert.equal(introspected.schema.mutationType, 'Mutation');
+      assert.ok(introspected.schema.types.some(type => type.name === 'User'));
+    });
+
+    await t.test('devtools_sourcemap lists scripts with maps and fetches metadata', async () => {
+      const page = await open(fixture.origin + '/map.html', { settleMs: 600 });
+      const list = await client.call('devtools_sourcemap', { action: 'list', tabId: page.sessionId });
+      assert.ok(list.totals.withSourceMaps >= 1, JSON.stringify(list.totals));
+      const appMap = list.scripts.find(s => s.url.endsWith('/app.js'));
+      assert.ok(appMap, JSON.stringify(list.scripts));
+      assert.ok(String(appMap.sourceMapURL).endsWith('app.js.map'), String(appMap.sourceMapURL));
+      const fetched = await client.call('devtools_sourcemap', { action: 'fetch', tabId: page.sessionId, maxMaps: 2 });
+      const map = fetched.maps.find(m => m.scriptUrl.endsWith('/app.js'));
+      assert.ok(map, JSON.stringify(fetched.maps));
+      assert.equal(map.httpStatus, 200);
+      assert.equal(map.map.sourcesCount, 2);
+      assert.equal(map.map.sourcesContentCount, 2);
+      assert.ok(map.map.sources.some(s => String(s).includes('a.js')));
+    });
+
+    await t.test('devtools_replay re-sends requests with json overrides', async () => {
+      const replayed = await client.call('devtools_replay', {
+        url: fixture.origin + '/api/echo', method: 'POST', json: { hello: 'replay' }
+      });
+      assert.equal(replayed.response.status, 200);
+      assert.match(replayed.response.bodyExcerpt, /ok/);
+    });
+
+    await t.test('devtools_security_probe finds surface and credential findings', async () => {
+      const page = await open(fixture.origin + '/login-form.html', { settleMs: 600 });
+      const all = await client.call('devtools_security_probe', { action: 'all', tabId: page.sessionId, authenticatedMarkers: ['Landed'] });
+      const types = all.surface.findings.map(f => f.type);
+      assert.ok(types.includes('credential-form-get'), JSON.stringify(types));
+      assert.ok(types.includes('open-redirect-param'), JSON.stringify(types));
+      assert.ok(types.includes('third-party-scripts'), JSON.stringify(types));
+      assert.ok(all.surface.risky, true);
+      assert.equal(all.credentials.exposed, true);
+      const credTypes = all.credentials.findings.map(f => f.type);
+      assert.ok(credTypes.includes('url-query-param'));
+      assert.ok(credTypes.includes('storage-secret') || credTypes.includes('storage-jwt'));
+      assert.ok(all.credentials.findings.every(f => f.value === '[REDACTED]'));
+    });
+
+    await t.test('devtools_reverse_engineer reports captured API patterns', async () => {
+      const report = await client.call('devtools_reverse_engineer', {
+        url: fixture.origin + '/graph.html', includeDom: true, networkIdleWaitMs: 500
+      });
+      assert.ok(report.captureReadiness.networkEnabled === true);
+      assert.ok(report.report.totals.capturedRequests >= 1);
+      assert.ok(report.report.apiEndpoints.some(e => e.path.endsWith('/graphql')), JSON.stringify(report.report.apiEndpoints));
+      assert.ok(report.report.dom.counts.forms !== undefined);
+    });
+
+    await t.test('devtools_llm_probe detects Opposite Day susceptibility in the chat fixture', async () => {
+      const page = await open(fixture.origin + '/chat.html');
+      const probed = await client.call('devtools_llm_probe', {
+        tabId: page.sessionId,
+        inputSelector: '#chat-input',
+        responseSelector: '#response',
+        probes: ['opposite_day'],
+        timeoutMs: 8000
+      });
+      assert.equal(probed.summary.probesRun, 1);
+      assert.equal(probed.summary.hits, 1);
+      assert.equal(probed.summary.susceptible, true);
+      assert.equal(probed.attempts[0].answered, 'false');
+      assert.equal(probed.attempts[0].hit, true);
+    });
+  } finally {
+    for (const tabId of opened) await client.call('devtools_close_tab', { tabId }).catch(() => {});
     await client.close();
     await fixture.close();
   }
